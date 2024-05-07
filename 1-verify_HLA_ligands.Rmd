@@ -1,0 +1,610 @@
+---
+title: "Verifying MS detected peptides as HLA ligands"
+author: "Kaspar Bresser"
+date: "29/07/2021"
+output: 
+  github_document:
+   toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+#                      comment = NA,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+
+```
+
+Below a few analysis that we performed to verify if the peptides detected by Mass Spec were indeed HLA ligands
+
+Lets load in the packages required for the analysis.
+
+```{r loading}
+library(ggseqlogo)
+library(pheatmap)
+library(RColorBrewer)
+library(seqinr)
+library(ggrepel)
+library(ggpubr)
+library(scales)
+library(rstatix)
+library(viridis)
+library(tidyverse)
+```
+
+
+
+# Compare length distributions
+
+HLA ligands have a recognizable length distribution, with the majority being 9mers. We'll compare the length distributions of the MS detected peptides with the length distribution of validated HLA ligands derived from melanomas.
+
+Lets import the melanomas dataset (downloaded from IEDB). First line of the file is non-sense, so ignore that. Peptide sequences are present in the 'Description' column.
+
+```{r import_melanoma_IEDB}
+read_csv("Data/IEDB_melanoma_ligands.csv", skip = 1) %>% 
+  select(3) %>% 
+  rename(Sequence = contains("Description")) %>% 
+  mutate(length = nchar(Sequence),
+         source = "IEDB") -> IEDB.peptides
+
+IEDB.peptides
+
+table(IEDB.peptides$length)
+```
+
+Indeed, the vast majority of peptides are 9mers. 
+
+Now import the MS detected peptides from our dataset. The peptides are stored as multiple files, so will import as a list column using the `purrr::map` function. Needed to set the q-Value column as character to resolve some parsing errors.
+
+The MS peptide tables annoyingly contain different column names, so in order to unnest them I combined `dplyr::select` with `purrr:map` to retain only the peptide sequence column from each dataframe. Then use unnest and add length info.
+
+```{r import_tumors}
+file.names<- list.files("Data/MS_peptides")
+
+MS.peptides <- tibble(
+  
+  peptide.tables = map( list.files("Data/MS_peptides", full.names = T), read_tsv, col_types = cols(`q-Value` = "c") ),
+  source = c( "M026.X1", "NKIRTIL006","SK-MEL-95")
+
+  )
+
+MS.peptides
+
+```
+
+
+```{r}
+MS.peptides %>% 
+  mutate(peptide.tables = map(peptide.tables, select, "Sequence")) %>% 
+  unnest(cols = peptide.tables) %>% 
+  mutate(length = nchar(Sequence))  -> MS.peptides
+
+MS.peptides
+
+```
+
+
+Can now combine the tibbles and calculate the fraction-of-total for each peptide length to nicely visualize the distribution. Focusing only on sizes 8-14 as that was the range that we looked for in the mass-spec. 
+
+
+```{r calculate_fractions}
+MS.peptides %>% 
+  bind_rows( IEDB.peptides) %>% 
+  filter(length < 15, length > 7) %>% 
+  mutate(length = as.factor(length))%>%
+  count(source, length) %>% 
+  group_by(source) %>% 
+  mutate(fraction = n/sum(n)) -> length.distributions
+
+write_tsv(length.distributions, ("Output/Figure_1B.tsv"))
+
+length.distributions
+```
+
+```{r length_distribution}
+length.distributions %>% 
+  ggplot(aes(x = length, y = fraction))+
+  geom_bar(aes(fill = source), stat = "identity",  position = "dodge")+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave("Figs/verify_length_distribution.pdf", width = 3, height = 1.5, scale = 1.5)
+```
+
+
+# AA usage vs IEDB
+
+Another facet we can look at is the amino acid usage of our MS detected peptides and compare it to the amino acid frequencies found in IEDB. 
+
+To calculate the frequencies lets first extract the peptide sequences as a list. Nest the peptides by source, an then use `purrr:map` with `dplyr::pull` to extract the sequences into a character variable. Then deframe these into a named list.  
+
+```{r get_peptide_list}
+MS.peptides %>% 
+  bind_rows( IEDB.peptides) %>% 
+  group_by(source) %>%
+  nest %>% 
+  mutate(seqs = map(data, pull, "Sequence")) %>% 
+  select(source, seqs) %>% 
+  deframe() -> MS.peptide.list
+
+str(MS.peptide.list)
+
+```
+
+Used this bit of code below to get all the amino acids as a character vector. 
+
+```{r get_AAs}
+MS.peptide.list[[1]] %>% 
+  str_flatten %>% 
+  str_split("") %>% 
+  unlist() %>% 
+  unique() -> amino.acids
+
+amino.acids
+```
+
+Now use a series of `purrr:map` calls to (1) paste peptides for each source into a single character vector using `stringr::str_flatten`, (2) count all amino acids using `stringr::str_count`, and (3) use `stringr::set_names` to change to named vectors.
+
+```{r count_AAs}
+MS.peptide.list %>% 
+  map(str_flatten) %>% 
+  map(str_count, amino.acids) %>% 
+  map(set_names, amino.acids) -> AA.counts
+
+AA.counts
+```
+
+Next we can switch back to a tibble format. First `purrr:map` the enframe function to get a list of count tables, then enframe those into a single tibble, and unnest. 
+
+```{r to_tibble}
+AA.counts %>% 
+  map(enframe, "AA", "count") %>% 
+  enframe( "source", "counts") %>% 
+  unnest(counts) -> AA.counts
+
+AA.counts
+```
+
+Now calculate frequencies, and reshuffle the tibble slightly to allow us to plot the tumors vs IEDB.
+
+```{r prep_for_plot}
+AA.counts %>% 
+  group_by(source) %>% 
+  mutate(fraction = count/sum(count)) %>% 
+  pivot_wider(id_cols = c(AA) , names_from = source, values_from = fraction) %>% 
+  pivot_longer(cols = c(`SK-MEL-95`, `M026.X1`, `NKIRTIL006`), names_to = "tumor", values_to = "tumorFraction") -> to.plot
+
+to.plot
+```
+
+And make the plot. Used `ggrepel::geom_label_repel` to add the amino acid identities.
+
+```{r AA_freq_vs_IEDB, fig.width=12, fig.asp=.5}
+to.plot %>% 
+  ggplot( aes(x = tumorFraction, y = IEDB))+
+  geom_smooth(method = "lm", color = "red")+
+  geom_point(aes(fill=AA), colour="black",pch=21, size=5)+
+  scale_fill_viridis(discrete = T)+
+  geom_label_repel(aes(label = AA),
+                   box.padding   = .5, 
+                   point.padding = 0.5,
+                   segment.color = 'black', size = 3 )+
+  labs(x = "AA usage fraction of MS detected peptides", y = "AA usage fraction within IEDB")+
+  theme_minimal()+
+  theme(legend.position = "none")+
+  facet_wrap(~tumor)
+
+ggsave("Figs/verify_AAdist_tumor_vs_IEDB.pdf", width = 8.5, height = 3, scale = 1.5)
+
+```
+
+Finally, calculate the Spearman correlation coefficients. Using the __rstatix__ package
+
+```{r AA_freq_vs_IEDB_stat}
+to.plot %>% 
+  group_by(tumor) %>% 
+  cor_test(tumorFraction, IEDB, method = "spearman") %>% 
+  adjust_pvalue(method = "bonferroni")
+```
+
+# AA usage vs proteome
+
+Having seen that the AA usage of IEDB peptides and our MS detected peptides correspond quite well, we next looked how well the AA usage of MS detected peptides corresponds to AA usage within the proteome of these tumors.
+
+To do this, we'll make use of the reference libraries used for each of the tumors. These contain all (RNA) expressed protein sequences. Allowing us the contain amino acid usage across all proteins that were expressed in each line. 
+
+Will use `seqinr::read.fasta` to read the files. Read in the files as a list, for easy manipulation
+
+```{r get_expressed_proteins}
+file.names <- list.files("Data/sprot_databases/databases_melanomas")
+file.list <- list.files("Data/sprot_databases/databases_melanomas", full.names = T)
+
+map(file.list, read.fasta,  seqtype = "AA", seqonly = T) %>%
+  set_names( map(str_split(file.names, "\\_|\\."), 2) ) -> references
+
+summary(references)
+```
+
+Now, like we did in the previous analysis, use a series of `purrr:map calls` to (1) paste peptides for each source into a single character vector using `stringr::str_flatten`, (2) count all amino acids using `stringr::str_count`, and (3) use `stringr::set_names` to change to named vectors.
+
+```{r count_AAs2}
+references %>% 
+  map(str_flatten) %>% 
+  map(str_count, amino.acids) %>% 
+  map(set_names, amino.acids) -> AA.counts.ref
+
+AA.counts.ref
+```
+
+Again, in the same manner as above, transform to a tibble format.
+
+```{r to_tibble2}
+AA.counts.ref %>% 
+  map(enframe, "AA", "count.ref") %>% 
+  enframe( "source", "counts") %>% 
+  unnest(counts) -> AA.counts.ref
+
+AA.counts.ref
+```
+
+Now we can combine the tumor count tibble, and the reference count tibble. We'll drop the IEDB count from the former, and calculate the two fractions we'd like to plot.
+
+```{r prep_for_plot2}
+AA.counts %>% 
+  mutate(source = str_remove_all(source, "\\-|\\.")) %>% 
+  filter(!(source == "IEDB")) %>% 
+  full_join(AA.counts.ref) %>% 
+  group_by(source) %>% 
+  mutate(fraction.MS = count/sum(count),
+         fraction.ref = count.ref/sum(count.ref)) -> to.plot2
+
+to.plot2
+```
+
+And make the plots.
+
+```{r AA_freq_vs_proteome, fig.width=12, fig.asp=.5}
+to.plot2 %>% 
+  ggplot( aes(x = fraction.MS, y = fraction.ref))+
+  geom_smooth(method = "lm", color = "red")+
+  geom_point(aes(fill=AA), colour="black",pch=21, size=5)+
+  scale_fill_viridis(discrete = T)+
+  geom_label_repel(aes(label = AA),
+                   box.padding   = .5, 
+                   point.padding = 0.5,
+                   segment.color = 'black', size = 3 )+
+  labs(x = "AA usage fraction of MS detected peptides", y = "AA usage fraction within proteome")+
+  theme_minimal()+
+  theme(legend.position = "none")+
+  facet_wrap(~source)
+
+ggsave(("Figs/verify_AAdist_tumor_vs_proteome.pdf"), width = 8.5, height = 3, scale = 1.5)
+
+```
+
+Finally, calculate the Spearman correlation coefficients. We'll find that, although a weak correlation still exsists, it is much weaker than the correlation with the IEDB peptides. 
+
+```{r AA_freq_vs_proteome_stat}
+to.plot2 %>% 
+  group_by(source) %>% 
+  cor_test(fraction.MS, fraction.ref, method = "spearman") %>% 
+  adjust_pvalue(method = "bonferroni")
+```
+
+
+# AA positional bias
+
+Another facet we can look at is whether amino acids favor specific positions within the MS peptides. To do this we'll focus on the 9mers of our dataset, determine the amino acid usage at each position, and compare that to the overall amino acid usage in proteins. That will give us some idea of the enrichment of AAs at specific positions.
+
+First filter on 9mers, and extract the peptide sequences of each tumor as a list.
+
+```{r extract_9mers}
+MS.peptides %>% 
+  filter(length == 9) %>% 
+  group_by(source) %>%
+  nest %>% 
+  mutate(seqs = map(data, pull, "Sequence")) %>% 
+  select(source, seqs) %>% 
+  deframe() -> tumor.9mers
+
+str(tumor.9mers)
+```
+
+Now we'll use a nested application of purrr:map to extract the amino acids found at each position. Basically, the first call maps over the numeric sequence 1:9 (i.e. the peptide positions), the nested call maps the `stringr::str_sub` function over the 9mer list using the former numeric sequence as inputs to the start/end arguments.
+
+This will give us a list of length 9 (the 9 positions that we gave as input in the first call), each containing a list of the tumors, which in turn contain the AAs at the given position.
+
+```{r list_positions}
+
+map(1:9, ~map(tumor.9mers, str_sub, start = ., end = .)) -> positions.list
+
+str(positions.list)
+
+```
+
+Next we use a series of calls to `purrr::modify_depth` to get our amino acid counts. This function is very useful to edit nested lists, like the one we ended up with now. It will basically apply the function passed to modify_depth at the "list depth" given. The amino acids of a given position, of a given tumor are stored at the 2nd level, so we pass `depth = 2`.
+
+We'll first flatten the character vectors to a single string (comprising all AAs at that position), then count the amino acids, and finally set their names. 
+
+```{r count_AAs_nested}
+positions.list %>% 
+  modify_depth(.depth = 2, str_flatten) %>% 
+  modify_depth(.depth = 2, str_count, pattern = amino.acids) %>% 
+  modify_depth(.depth = 2, set_names, amino.acids) -> AA.counts.positions
+
+str(AA.counts.positions)
+```
+
+Now we have a list of 9 (1 for each position), containing lists of 3 (tumors), containing counts for each AA. To convert this messy nested list to a tidy tibble, we can call the `enframe` function to each level of the list. 
+
+```{r make_nested_tibble}
+
+AA.counts.positions %>% 
+  modify_depth(.depth = 2, enframe, "AA", "count") %>% 
+  modify_depth(.depth = 1, enframe, "tumor", "count.table") %>% 
+  enframe("position", "data") -> AA.counts.positions.table
+
+AA.counts.positions.table
+```
+
+
+Now we've got nested tibbles, lets unfold all those data into a table and we've got our data in a useful format!
+
+
+```{r make_tidy_table}
+AA.counts.positions.table %>% 
+  unnest(cols = data) %>% 
+  unnest(cols = count.table) %>% 
+  mutate(count = count + 1) -> AA.counts.positions.table
+
+AA.counts.positions.table
+```
+
+Now we can join this tibble with the AA.counts.ref that contains the reference counts for each tumor. Next, group by tumor and position and calculate the position frequencies. Some amino acids do not occur at specific positions, so calculating the log2 enrichment will result in a `-Inf`. Convert these to NA's using `dplyr::na_if`.
+
+```{r get_position_frequencies}
+AA.counts.positions.table %>%
+  mutate(tumor = str_remove_all(tumor, "\\-|\\.")) %>% 
+  left_join(AA.counts.ref, by = c("tumor" = "source", "AA" = "AA")) %>% 
+  group_by(tumor, position) %>% 
+  mutate(fraction.MS = count/sum(count),
+         fraction.ref = count.ref/sum(count.ref),
+         position.bias = log2(fraction.MS/fraction.ref)) %>% 
+  ungroup() -> position.frequencies
+
+write_tsv(position.frequencies, ("Output/Fig_1CD.tsv"))
+
+position.frequencies
+```
+
+Now we've got all the data we need to start plotting the positional bias amino acids. We'll visualize as a heatmap using the __[pheatmap](https://www.rdocumentation.org/packages/pheatmap/versions/1.0.12/topics/pheatmap)__ package. The pheatmap function takes a matrix as input, so we'll have to re-format a bit. I'll convert to a list of matrices, which will allow us to plot the heatmaps in a for loop. 
+
+To get the desired result, first save the order of the tumor names, so we can use that to refer to our tables. 
+
+Then, split the tibble into 3 tibbles (1 for each tumor), and add names, so we end up with a named list of tibbles. Then map the select function to pick out the position, AA and enrichment columns. Then map pivot_wider to set positions as columns, and finally set the AA column to the rownames so we can convert to matrix.
+
+```{r make_matrices}
+tumor.names <- unique(position.frequencies$tumor)
+
+position.frequencies %>% 
+  group_split(tumor) %>% 
+  set_names(tumor.names) %>% 
+  map(select, c(position, AA, position.bias)) %>% 
+  map(pivot_wider, names_from = position, values_from = position.bias) %>% 
+  map(column_to_rownames, "AA") %>% 
+  map(as.matrix) -> position.frequencies.matrices
+
+position.frequencies.matrices
+```
+
+This gives a list of matrices in which each the columns correspond to peptide position (1-9), the rows correspond to the 20 amino acids, and the values are log2 transformed folds of AA occurrence at each position relative to their expected occurrence in a random scenario.
+
+Simply for loop over de list and make the heatmaps. Will only cluster the AAs. NAs will be colored in grey. As you can see in the matrices above, there's a couple of values that are very low, which will make the scaling in the heatmap a bit funky. As we're mainly interested in relative enrichment/depletion of AA's at different positions, I'll manually set the color-scale to values between -4 and 2 using the breaks argument. To set the colors properly so that the mid-point is around 0, I create a color vector by picking colors from the two halves `"RdYbu"` color-scale, re-positioning as necessary.  
+
+```{r plot_heatmaps, fig.asp=1.8}
+library(gridExtra)
+cols <- c( colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu"))[1:4])(66),
+           colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu"))[4:7])(34))
+
+plot.list <- list()
+for(tumor in tumor.names){
+
+ plot.list[[tumor]] <- pheatmap(position.frequencies.matrices[[tumor]],  
+                                cluster_rows = T, cluster_cols = F,
+                                clustering_method = "complete",  
+                                color = cols,  breaks = seq(-4,2,by=0.06), 
+                                main = tumor, silent = T)[[4]]
+  
+}
+
+maps <- do.call(grid.arrange, plot.list)
+
+ggsave(("Figs/verify_AA_position_frequency.pdf"), plot = maps,  width = 6, height = 10)
+
+```
+
+One way to summarise this information is to plot the average amount of positional bias at each position, for each tumor. Below I do this by calculating, at each position, the median absolute positional.bias (which was a log2 metric). This would roughly mean that at positions where this value is >1, the median enrichment/depletion of amino acids was more than 2-fold. 
+
+```{r positional_bias}
+position.frequencies %>% 
+  group_by(tumor, position) %>% 
+  summarise(bias = median(abs(position.bias), na.rm=TRUE) ) %>% 
+  ggplot(aes(x = position, y = bias, fill = tumor))+
+  geom_bar(stat = "identity", position = "dodge",  col = "black")+
+  scale_x_continuous(breaks = pretty_breaks(n = 9))+
+  geom_hline(yintercept = 1, linetype = "dashed")+
+  theme_classic()
+
+
+ggsave("Figs/verify_positional_bias.pdf", width = 3, height = 1.5, scale = 1.5)
+
+position.frequencies %>% 
+  group_by(tumor, position) %>% 
+  summarise(bias = median(abs(position.bias), na.rm=TRUE) ) %>% 
+  write_tsv("Output/Fig_1C.tsv")
+```
+
+
+# Sequence logo's
+
+We'll compare the peptide sequence motifs that we've found using the GibbsCluster algorithm to the sequence motifs of known ligands of each allele expressed by the melanoma lines. 
+
+To make the reference, we'll use all Human HLA class I ligands in IEDB. 
+
+```{r import_class_I}
+IEDB.class.I <- read_tsv("Data/human_class_I_ligands_IEDB.tsv")
+
+IEDB.class.I
+```
+
+Store the expressed alleles of each line in variables
+
+```{r set_alleles}
+MEL.list <- list(
+  c("HLA-A*02:01","HLA-A*01:01", "HLA-B*08:01","HLA-B44","HLA-C*05:01","HLA-C*07:01"),
+  c("HLA-A*02:01","HLA-A24", "HLA-B*18:01","HLA-B*51:01","HLA-C*05:01","HLA-C*16:01"),
+  c("HLA-A*02:01", "HLA-B*15:01","HLA-B44","HLA-C*05:01","HLA-C*03:04")
+)
+```
+
+Define a function that extracts the peptide sequences needed for the logo for a given HLA allele. And a function that maps this function over the HLA alleles of a given melanoma line and generates the sequence logo plots. 
+
+```{r define_logo_functions}
+get_peptides <- function(al){
+  IEDB.class.I %>% 
+    filter(`Allele Name` == al) %>% 
+    filter(nchar(`Description`) == 9) %>% 
+    filter(`Qualitative Measure` == "Positive") %>% 
+    pull(Description)
+}
+
+make_logos <- function(tum, main.title){
+tum %>% 
+  map(get_peptides) %>% 
+  set_names(tum) %>% 
+  ggseqlogo()+
+    ggtitle(main.title)
+}
+
+```
+
+Then map this latter function over the three melanoma lines and plot. 
+
+```{r plot_logos, fig.width=8, fig.asp=1.5}
+Mels <- c("SK-MEL-95", "M026.X1", "NKIRTIL006")
+
+logos <- map2(MEL.list, Mels, make_logos)
+
+ggarrange(plotlist = logos, ncol = 1, common.legend = T, legend = "bottom" )
+
+ggsave("Figs/Logos_HLA_alleles.pdf", width = 6, height = 12)
+```
+
+Now make the logo's for the peptide cluster identified by GibbsCluster. The peptides that make up each cluster are stored in single files per cluster. Bit below imports each in a list format. 
+
+```{r get_cores}
+map(paste0("Data/gibbs_clusters/", c("M026X1", "SKMEL95", "NKIRTIL006")), list.files, all.files = T, pattern = "core" )  %>% 
+  set_names(Mels) %>%
+  map2(c("M026X1", "SKMEL95", "NKIRTIL006"), ~paste0("Data/gibbs_clusters/", .y,"/", .x)) %>% 
+  map(~map(., read_lines)) -> peptide.cores
+  
+str(peptide.cores)
+```
+
+Define a function that plots the logos and map it over the tumor lines. 
+
+```{r make_core_logos, fig.width=8, fig.asp=1.5}
+make_logos <- function(tum, main.title){
+tum %>% 
+  ggseqlogo()+
+    ggtitle(main.title)
+}
+
+logos <- map2(peptide.cores, c("SK-MEL-95", "M026.X1", "NKIRTIL006"), make_logos)
+
+ggarrange(plotlist = logos, ncol = 1, common.legend = T, legend = "bottom" )
+
+ggsave("Figs/Logos_gibbs_cores.pdf", width = 6, height = 12)
+```
+
+
+# affinity  in train data
+
+To look at peptide level features, I'll use the train dataset that we used for the randomforest models. This table contains a partition of the detected MS peptides, plus large amount (4-fold more than the detected peptides) of decoy peptides. 
+
+Lets load in the data
+
+```{r import_data}
+columns.to.keep <- c("ligand", "rank","tumor")
+
+read_tsv("Data/HLA_train_set_complete.tsv") %>% 
+  select(one_of(columns.to.keep)) -> peptide.table
+  
+peptide.table
+```
+
+According to NetMHCpan peptides can be subdivided in different binding classes. Those above 0.5 percentile rank are generally called "strong binders", those above 2.0 percentile rank are generally called "weak binders".
+Lets plot the distribution of these classes
+
+```{r binding_classes}
+tumor.order <- c("SKMEL95", "M026X1", "NKIRTIL006")
+
+peptide.table %>% 
+  mutate(tumor = factor(tumor, levels = tumor.order)) %>%
+  na.omit() %>% 
+  mutate(bind.strength = case_when(rank <= 0.5 ~ "SB",
+                                   rank <= 2 ~ "WB",
+                                   rank > 2 ~ ">2%"),
+         bind.strength = factor(bind.strength, levels = c("SB", "WB", ">2%"))) %>% 
+  ggplot(aes(x = ligand, fill = bind.strength))+
+    geom_bar(position = "fill", color = "black")+
+    scale_fill_manual(values = c("tomato4", "tomato1", "steelblue1"))+
+    facet_wrap(~tumor)+
+    theme_classic()+
+  theme(panel.grid.major.y = element_line(), legend.position = "bottom")
+  
+ggsave("Figs/peptide_binding_classes.pdf", width = 45, height = 48, units = "mm", scale = 2)
+```
+
+And calculate the frequencies at which these classes occur. 
+
+```{r binding_classes_freqs}
+peptide.table %>% 
+  mutate(bind.strength = case_when(rank <= 0.5 ~ "SB",
+                                   rank <= 2 ~ "WB",
+                                   rank > 2 ~ ">2%")) %>% 
+  dplyr::count(bind.strength, ligand, tumor) %>% 
+  group_by(ligand, tumor) %>% 
+  mutate(freq = n / sum(n)) %>% 
+  group_by(tumor) %>% 
+  arrange(ligand) %>% 
+  group_split()
+  
+```
+
+And finally some violin plots of the affinities of real and decoy peptides. 
+
+
+```{r affinity_density, fig.width=8, fig.asp=.5}
+peptide.table %>% 
+    mutate(tumor = factor(tumor, levels = tumor.order)) %>% 
+  ggplot(aes(y = log10(rank+1), x = tumor, fill = ligand))+
+    geom_violin(scale = "width")+
+    scale_y_reverse()+
+    theme_classic()+
+    theme(panel.grid.major.y = element_line())
+  
+ggsave("Figs/affinity_density.pdf", width = 5, height = 3)
+```
