@@ -1,0 +1,205 @@
+---
+title: "Trim sequence features"
+author: "Kaspar Bresser"
+date: "24/01/2024"
+
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+The feature library contains many features. We intend to train multiple random forest models as a first exploration to see if certain features influence HLA sampling. No make these models a little bit less heavy, we'll subset the features to a more manageable size. We'll filter based on their variance using the `caret` package
+
+
+```{r loading}
+library(caret)
+library(tidytext)
+library(tidyverse)
+```
+
+# Initial trimming
+
+## Import and inspect
+
+```{r import_feats}
+feats <- read_tsv(file = ("Data/Protein_per_Uniprot_entry_library_v3.csv.zip"))
+
+```
+
+
+Lets have a look at the different types of features in the dataset. Feature names use "_" as interpunction. The broad categories of features seem to be stored in the last word of the feature name. Will extract that information and count the occurrences. 
+
+
+```{r count_feat_types}
+feat.names <- names(feats[-1])
+
+feat.classes <- (c("UTR5","CDS" ,"UTR3","hsa",  "count"))
+
+feat.classes %>% 
+  map( ~str_subset(feat.names,.)) %>% 
+  set_names(feat.classes) %>% 
+  enframe %>% 
+  mutate(count = map_dbl(value, length),
+         name = factor(name, levels = feat.classes)) %>% 
+  ggplot(aes(x = name, y = (count), fill = name, label = count))+
+    geom_bar(stat = "identity")+
+    scale_y_log10()+
+  theme_classic()+
+  geom_text(nudge_y = 0.1)
+
+ggsave("Figs/trim_feature_counts.pdf", width = 4, height = 3)
+
+
+
+feat.classes %>% 
+  map( ~str_subset(feat.names,.)) %>% 
+  set_names(feat.classes) %>% 
+  str()
+
+
+
+
+```
+
+Features corresponding to the 3' UTR, 5' UTR and CDS seem quite equal in numbers. Features ending in "count", appear to be protein related. m6a is a mRNA modification. 
+
+## Calculate variance
+
+
+We'll use `caret::nearZeroVar` to calculate the amount of variance across features. First convert the `NA` values to zero's. 
+
+
+```{r calculate_variance, cache=TRUE}
+
+feats %>% 
+  mutate(across(everything(), replace_na, 0 )) -> feats
+
+
+variance.metrics <- nearZeroVar(feats[-1], saveMetrics = TRUE)
+
+write_tsv(variance.metrics, "Output/variance_metrics.tsv")
+
+```
+
+Now we have the variance metrics, lets have a look at them. First tidy the output table a bit. Move the names to a column, generate a feature.type column, and filter for the main types. 
+
+
+```{r tidy_variance}
+feat.classes <- str_sort(c("UTR5", "UTR3", "CDS", "count", "hsa"))
+
+variance.metrics %>% 
+  as_tibble(rownames = "feature") %>% 
+  mutate(feature.type = case_when(str_detect(feature, "UTR5") ~ "UTR5",
+                                  str_detect(feature, "UTR3") ~ "UTR3",
+                                  str_detect(feature, "count") ~ "count",
+                                  str_detect(feature, "CDS") ~ "CDS",
+                                  str_detect(feature, "hsa") ~ "miR",
+                                  TRUE ~ "misc"))  -> variance.metrics
+
+variance.metrics %>% 
+  count(feature.type)
+
+variance.metrics %>% 
+  filter(feature.type == "misc")
+```
+
+Now plot the frequency ratio. This indicates the ratio between the most common, and the second most common value. A lower value would indicate a more heterogeneous variable. 
+
+```{r plot_freqRatio}
+variance.metrics %>% 
+  ggplot(aes(x = freqRatio))+ 
+    geom_histogram(binwidth = .1)+
+    facet_wrap(~feature.type, scales = "free_y")+
+    scale_x_log10()+
+    geom_vline(xintercept = 500, color = "red")
+```
+
+And the percentage of unique values within each variable, a lower value indicates a more homogeneous variable.
+
+```{r plot_percentage}
+variance.metrics %>% 
+  ggplot(aes(x = percentUnique))+ 
+    geom_histogram(binwidth = .1)+
+    facet_wrap(~feature.type, scales = "free_y")+
+    scale_x_log10()+
+    geom_vline(xintercept = .05, color = "blue")
+
+```
+
+
+Lets look what we would slice off with these cutoffs. 
+
+```{r plot_both}
+variance.metrics %>% 
+  ggplot(aes(x = freqRatio, y =percentUnique ))+ 
+    geom_point()+
+    facet_wrap(~feature.type)+
+    scale_x_log10()+
+    scale_y_log10()+
+    geom_vline(xintercept = 500, color = "red")+
+    geom_hline(yintercept = .05, color = "blue")
+```
+
+## Set cutoffs and extract
+
+If we adhere to these cutoffs we'll be left with a significantly reduced pool of features.
+
+
+```{r count_features}
+variance.metrics %>% 
+  filter(feature.type %in% c("miR","count") | (freqRatio < 100 & percentUnique > 0.05) )  %>% 
+  count(feature.type)
+
+```
+
+Let extract the selected features. Set the cutoffs (I kept all of the protein level modifications, as this was such a small set). In addition, I currently remove features that are directly protein related, i.e. codons, AAs. 
+
+```{r extract_features}
+# Just to show that these protein related features are in there
+str_subset(variance.metrics$feature, "codon|amino|AA_length")
+
+variance.metrics %>% 
+  filter(feature.type %in% c("miR","count")  | (freqRatio < 500 & percentUnique > 0.05)) %>% 
+  filter( !(feature %in% str_subset(feature, "codon|amino|AA_length")) ) %>% 
+  filter(feature.type != "misc") %>% 
+  group_by(feature.type) %>% 
+  group_split() %>% 
+  set_names(c("CDS", "3UTR", "5UTR", "count", "hsa")) %>% 
+  map(pull, feature) -> feature.list 
+
+str(feature.list)
+```
+
+## Write data
+
+And now we can write out these features as individual tables. Create a directory, and then use `purrr:map` to select the desired columns from the feats table, and finally used `purrr:map2` to write the resulting list of tibbles to there desired locations.
+
+We can then use these tibbles for the randomforest model training.
+
+```{r write_data}
+dir.create("Output/feature_files")
+
+feature.list %>% 
+  map( ~select(feats, one_of(c("Entry", .))) ) %>% 
+  map2( paste0("Output/feature_files/", c("CDS", "3UTR", "5UTR", "count", "hsa"), "_features.tsv") , write_tsv )
+```
