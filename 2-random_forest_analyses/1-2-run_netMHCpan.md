@@ -1,0 +1,134 @@
+run netMHCpan4.1
+================
+Kaspar Bresser
+04/02/2024
+
+- [Run netMHCpan train set](#run-netmhcpan-train-set)
+- [Run netMHCpan test set](#run-netmhcpan-test-set)
+
+Used the code below to run netMHCpan on the train and test set peptides.
+
+``` r
+library(tidyverse)
+library(furrr)
+```
+
+## Run netMHCpan train set
+
+Get the file names
+
+``` r
+files <- paste0("Output/test_train_sets/", list.files("Output/test_train_sets/", pattern = "Train_Pep"))
+
+files
+```
+
+check the peptide lengths for each file
+
+``` r
+str_extract(files, "\\d+")
+```
+
+``` r
+HLA.alleles <-  c("HLA-A0201","HLA-A0101", "HLA-A2402", 
+                  "HLA-B0801", "HLA-B1801","HLA-B5101", "HLA-B1501", "HLA-B4402", 
+                  "HLA-C0501","HLA-C0701", "HLA-C1601", "HLA-C0304")
+```
+
+Run system command for netMHCpan, for each allele. Define function to
+get the arguments/flags for netMHCpan
+
+``` r
+args_netMHC <- function(allele, file.name, peptide.len){
+  c(
+    paste0("-a ", sub("(.{7})(.*)", "\\1:\\2", allele)),
+    paste0("-f ", file.name),
+    "-p",
+    "-rth 0.0",
+    "-rlt 0.0",
+    paste0("-l ", peptide.len),
+    "-t -100"
+  )
+}
+```
+
+wrapper function to predict for each length
+
+``` r
+netMHC_wrapper <- function(all.alleles, file.name){
+  
+  future_map(all.alleles, ~system2(command = "netMHCpan", 
+                      args = args_netMHC(., file.name, str_extract(file.name, "\\d+")), 
+                      stdout  = paste0("./Output/netMHCpan_predictions_train/netMHCpan_prediction_", .,
+                                      "_", str_extract(file.name, "\\d+") , ".txt")))
+  
+}
+```
+
+Run netMHCpan, parallel for the alleles
+
+``` r
+plan(multisession, workers = 6)
+
+map(files, ~netMHC_wrapper(HLA.alleles, .))
+```
+
+## Run netMHCpan test set
+
+Get the file names
+
+``` r
+files <- paste0("Output/test_train_sets/", list.files("Output/test_train_sets/", pattern = "Test_Pep"))
+
+files
+```
+
+check the peptide lengths for each file
+
+``` r
+str_extract(files, "\\d+")
+```
+
+``` r
+HLA.alleles <-  c("HLA-A0201","HLA-A0101", "HLA-A2402", 
+                  "HLA-B0801", "HLA-B1801","HLA-B5101", "HLA-B1501", "HLA-B4402", 
+                  "HLA-C0501","HLA-C0701", "HLA-C1601", "HLA-C0304")
+```
+
+Run system command for netMHCpan, for each allele. Define function to
+get the arguments/flags for netMHCpan
+
+``` r
+args_netMHC <- function(allele, file.name, peptide.len){
+  c(
+    paste0("-a ", sub("(.{7})(.*)", "\\1:\\2", allele)),
+    paste0("-f ", file.name),
+    "-p",
+    "-rth 0.0",
+    "-rlt 0.0",
+    paste0("-l ", peptide.len),
+    "-t -100"
+  )
+}
+```
+
+wrapper function to predict for each length
+
+``` r
+netMHC_wrapper <- function(all.alleles, file.name){
+  
+  future_map(all.alleles, ~system2(command = "netMHCpan", 
+                      args = args_netMHC(., file.name, str_extract(file.name, "\\d+")), 
+                      stdout  = paste0("./Output/netMHCpan_predictions_test/netMHCpan_prediction_", .,
+                                      "_", str_extract(file.name, "\\d+") , ".txt")))
+  
+}
+```
+
+Run netMHCpan, parallel for the alleles
+
+``` r
+plan(multisession, workers = 6)
+
+map(files, ~netMHC_wrapper(HLA.alleles, .))
+```

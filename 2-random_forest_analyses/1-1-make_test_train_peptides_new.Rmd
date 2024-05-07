@@ -1,0 +1,221 @@
+---
+title: "Make test and train sets"
+author: "Kaspar Bresser"
+date: "04/10/2023"
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+Used the code below to generate the train and test sets used for the random forests.
+
+```{r loading}
+library(tidyverse)
+library(furrr)
+```
+
+# Import MS detected peptides
+
+Read the MS detected peptides into a nested tibble, then unnest and select the columns we want to continue with. Also, only keep unique cases. 
+
+```{r read_ligands}
+file.names <- list.files(("Data/MS_peptides")) 
+
+HLA.ligands <- tibble(
+  
+  ligand.table = map( paste0("Data/MS_peptides/", file.names), read_tsv ),
+  tumor = map_chr(str_split(file.names, "_"), 1)
+
+  )
+
+#HLA.ligands <- mutate(HLA.ligands, case_when(tumor))
+
+HLA.ligands
+
+HLA.ligands <- mutate(HLA.ligands, tumor = c("M026X1", "SKMEL95", "NKIRTIL006"))
+
+# Define Columns to keep from the ligand tables
+keep <- c("rna","ribo",  "swissprot_id", "ligand", "peptide" )
+
+HLA.ligands %>% 
+  unnest( cols = ligand.table) %>% 
+  select(one_of(keep, "tumor")) %>% 
+  distinct() -> HLA.ligands
+
+HLA.ligands
+```
+
+
+Split test, train. 80/20
+
+```{r}
+HLA.ligands %>% 
+  group_by(tumor) %>% 
+  sample_frac(.8) -> train.ligands
+
+HLA.ligands %>% 
+  anti_join(train.ligands) -> test.ligands
+```
+
+
+import expression info
+
+```{r}
+file.names <- list.files("Data/protein_data/") 
+
+expression.data <- tibble(
+  
+  expression.info = map( paste0("Data/protein_data/", file.names), read_tsv ),
+  tumor = map_chr(str_split(file.names, "_"), 1)
+
+  )
+
+(expression.data <- unnest(expression.data, cols = expression.info) %>% select(!length))
+
+```
+
+import swissprotIDs that are in the library, import swissprot sequences, and combine with expression data
+
+```{r}
+"../2-random_forest_analyses/Data/Protein_per_Uniprot_entry_library_v2_RBP_GC_length_codon_AA_m6A_m5C_AtoI_m1A_m7G_CD8miRDB_PTM.csv" %>% 
+  read_tsv() %>% 
+  pull(Entry) -> IDs.in.library
+
+uniprot <- read_csv("UniProt_reviewed_input.tsv") %>% rename(swissprot_id = "sequence_id")
+
+uniprot %>% 
+  filter(swissprot_id %in% IDs.in.library)  -> uniprot
+
+expression.data %>% 
+  nest(expr = !tumor) %>% 
+  mutate(expr = map(expr, ~right_join(., uniprot))) %>% 
+  unnest(expr) %>% 
+  replace_na(list(rna = 0, ribo = 0)) -> expression.data
+
+```
+
+
+sample peptides for train data. 
+
+```{r}
+get_peptide <- function(tum, pep.len){
+  train.ligands %>% 
+    filter(tumor == tum) %>% 
+    filter(nchar(peptide) == pep.len) %>% 
+    pull(peptide) %>% 
+    toupper() -> s
+  
+  num <- nrow(filter(train.ligands, tumor == tum & nchar(peptide) == pep.len))*10
+  
+  expression.data %>% 
+    filter(tumor == tum) %>% 
+    mutate(peptide = sequence) %>% 
+    mutate(len = nchar(peptide)) %>% 
+    slice_sample(n = num*2, weight_by = len, replace = T) %>% 
+    rowwise() %>% 
+    mutate(num = sample(1:(nchar(peptide)-pep.len), 1),
+         peptide = str_sub(peptide, num, num+(pep.len-1))) %>% 
+    ungroup() %>% 
+    filter(!(peptide %in% s)) %>% 
+    select(peptide, swissprot_id, tumor, rna, ribo) %>% 
+    mutate(ligand = FALSE) %>% 
+    filter(swissprot_id %in% IDs.in.library) %>% 
+    distinct(peptide, .keep_all = T) %>% 
+    slice_sample(n = num)
+}
+
+
+
+decoys <- map2_dfr(rep(c("M026X1", "SKMEL95", "NKIRTIL006"), 3), rep(c(9,10,11), each = 3), get_peptide)
+
+train.set <- bind_rows(decoys, train.ligands)
+
+train.set %>% 
+  count(tumor, ligand, nchar(peptide))
+```
+
+
+sample peptides for test data. 
+
+```{r}
+get_peptide <- function(tum, pep.len){
+  test.ligands %>% 
+    filter(tumor == tum) %>% 
+    filter(nchar(peptide) == pep.len) %>% 
+    pull(peptide) %>% 
+    toupper() -> s
+  
+  num <- nrow(filter(test.ligands, tumor == tum & nchar(peptide) == pep.len))*1000
+  
+  expression.data %>% 
+    filter(tumor == tum) %>% 
+    mutate(peptide = sequence) %>% 
+    mutate(len = nchar(peptide)) %>% 
+    slice_sample(n = num*4, weight_by = len, replace = T) %>% 
+    rowwise() %>% 
+    mutate(num = sample(1:(nchar(peptide)-pep.len), 1),
+         peptide = str_sub(peptide, num, num+(pep.len-1))) %>% 
+    ungroup() %>% 
+    filter(!(peptide %in% s)) %>% 
+    select(peptide, swissprot_id, tumor, rna, ribo) %>% 
+    mutate(ligand = FALSE) %>% 
+    filter(swissprot_id %in% IDs.in.library) %>% 
+    distinct(peptide, .keep_all = T) %>% 
+    slice_sample(n = num)
+}
+
+
+decoys <- map2_dfr(rep(c("M026X1", "SKMEL95", "NKIRTIL006"), 3), rep(c(9,10,11), each = 3), get_peptide)
+
+test.set <- bind_rows(decoys, test.ligands)
+
+test.set %>% 
+  count(tumor, ligand, nchar(peptide))
+```
+
+
+Write out the table and peptide files
+
+
+```{r}
+write_tsv(train.set, "./Output/test_train_sets/HLA_train_set.tsv")
+
+train.set %>% 
+  transmute(pep.len = paste0(nchar(peptide), "AA"), peptide = peptide) %>% 
+  nest(data = peptide) %>% 
+  mutate(peptides = map(data, pull, peptide),
+         peptides = set_names(peptides, pep.len)) %>% 
+  pull(peptides) %>% 
+  map2(names(.), ~write_lines(.x, paste0("./Output/test_train_sets/mel_Train_Peptides_", .y, ".tsv")))
+
+write_tsv(test.set, "./Output/test_train_sets/HLA_test_set.tsv")
+
+test.set %>% 
+  transmute(pep.len = paste0(nchar(peptide), "AA"), peptide = peptide) %>% 
+  nest(data = peptide) %>% 
+  mutate(peptides = map(data, pull, peptide),
+         peptides = set_names(peptides, pep.len)) %>% 
+  pull(peptides) %>% 
+  map2(names(.), ~write_lines(.x, paste0("./Output/test_train_sets/mel_Test_Peptides_", .y, ".tsv")))
+```
+
+
+

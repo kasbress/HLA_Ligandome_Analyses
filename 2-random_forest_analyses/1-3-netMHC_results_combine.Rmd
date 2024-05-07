@@ -1,0 +1,212 @@
+---
+title: "combine netMHCpan result files"
+author: "Kaspar Bresser"
+date: "04/02/2024"
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      eval = FALSE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+
+```
+
+Used the code below to generate the train and test sets used for the random forests.
+
+```{r loading}
+library(tidyverse)
+```
+
+# Test data
+
+## Clean up files
+
+Define function to read in predictions for each peptide length, cleanup the netMHC output, and combine them in a single tsv file
+
+```{r}
+combine_and_clean <- function(allele){
+
+  file.list <- list.files("./Output/netMHCpan_predictions_test/", pattern = allele)
+  file.list <- paste0("./Output/netMHCpan_predictions_test/", file.list)
+  
+  file.list %>% 
+    map(read_lines) %>% 
+    map(~.[grepl("   1 HLA", .)]) %>% 
+    unlist() %>% 
+    c(" Pos         MHC        Peptide      Core Of Gp Gl Ip Il        Icore        Identity  Score_EL %Rank_EL", .) %>% 
+    write_lines(paste0("./Output/netMHCpan_predictions_test/", allele,"_all_clean.tsv"))
+  
+  gc()
+}
+```
+
+
+Apply the function for each allele
+
+```{r}
+HLA.alleles <-  c("HLA-A0201","HLA-A0101", "HLA-A2402", 
+                  "HLA-B0801", "HLA-B1801","HLA-B5101", "HLA-B1501", "HLA-B4402", 
+                  "HLA-C0501","HLA-C0701", "HLA-C1601", "HLA-C0304")
+
+map(HLA.alleles, combine_and_clean)
+```
+
+
+## Combine files per tumor line
+
+Write a function that reads in the allele predictions per tumor line, only imports the columns needed, joins them together, and selects the highest affinity rank.
+
+```{r}
+write_tumor_files <- function(alls, tum){
+  file.list <- paste0("./Output/netMHCpan_predictions_test/", alls,"_all_clean.tsv")
+  
+  file.list %>% 
+    map(~read_table(., col_types = cols_only(Peptide = col_character(), `%Rank_EL` = col_double()))) %>% 
+    map2(alls, ~setNames(.x, c("Peptide", .y))) %>% 
+    reduce(left_join, by = "Peptide") %>% 
+    distinct(Peptide, .keep_all = T) %>% 
+    pivot_longer(cols = !Peptide, names_to = "allele", values_to = "rank") %>% 
+    group_by(Peptide) %>% 
+    slice_min(rank, n=1) %>% 
+    write_tsv(paste0("./Output/netMHCpan_predictions_test/HLA_affinities_",tum,".tsv"))
+}
+```
+
+Define HLA typings per tumor line and run the function.
+
+```{r}
+typings <- list(M026X1 = c("HLA-A0201","HLA-A0101", "HLA-B0801", "HLA-B4402", "HLA-C0501","HLA-C0701"), 
+                SKMEL95 =c("HLA-A0201","HLA-A2402", "HLA-B1801","HLA-B5101","HLA-C0501","HLA-C1601"),
+                NKIRTIL006 = c("HLA-A0201", "HLA-B1501", "HLA-B4402", "HLA-C0501", "HLA-C0304" ))
+
+typings %>% 
+  map2(names(typings), ~write_tumor_files(.x, .y))
+
+```
+
+
+
+## Add scores to test set
+
+```{r}
+test.set <- read_tsv("./Output/test_train_sets/HLA_test_set.tsv")
+
+test.set %>% 
+  rename(Peptide = "peptide") %>% 
+  nest(data = !tumor) %>% 
+  mutate(peptide.affinities = map(paste0("./Output/netMHCpan_predictions_test/HLA_affinities_",tumor,".tsv"), read_tsv)) %>% 
+  mutate(data2 = map2(data, peptide.affinities, ~left_join(.x, .y, by = c("Peptide")))) %>% 
+  select(data2, tumor) %>% 
+  unnest(data2) %>% 
+  group_by(tumor) %>% 
+  distinct(Peptide, .keep_all = T) -> test.set.new
+
+write_tsv(test.set.new, "./Output/test_train_sets/HLA_test_set_complete.tsv")
+```
+
+
+
+# Train data
+
+## Clean up files
+
+Define function to read in predictions for each peptide length, cleanup the netMHC output, and combine them in a single tsv file
+
+```{r}
+combine_and_clean <- function(allele){
+
+  file.list <- list.files("./Output/netMHCpan_predictions_train/", pattern = allele)
+  file.list <- paste0("./Output/netMHCpan_predictions_train/", file.list)
+  
+  file.list %>% 
+    map(read_lines) %>% 
+    map(~.[grepl("   1 HLA", .)]) %>% 
+    unlist() %>% 
+    c(" Pos         MHC        Peptide      Core Of Gp Gl Ip Il        Icore        Identity  Score_EL %Rank_EL", .) %>% 
+    write_lines(paste0("./Output/netMHCpan_predictions_train/", allele,"_all_clean.tsv"))
+  
+  gc()
+}
+```
+
+
+Apply the function for each allele
+
+```{r}
+HLA.alleles <-  c("HLA-A0201","HLA-A0101", "HLA-A2402", 
+                  "HLA-B0801", "HLA-B1801","HLA-B5101", "HLA-B1501", "HLA-B4402", 
+                  "HLA-C0501","HLA-C0701", "HLA-C1601", "HLA-C0304")
+
+map(HLA.alleles, combine_and_clean)
+```
+
+
+## Combine files per tumor line
+
+Write a function that reads in the allele predictions per tumor line, only imports the columns needed, joins them together, and selects the highest affinity rank.
+
+```{r}
+write_tumor_files <- function(alls, tum){
+  file.list <- paste0("./Output/netMHCpan_predictions_train/", alls,"_all_clean.tsv")
+  
+  file.list %>% 
+    map(~read_table(., col_types = cols_only(Peptide = col_character(), `%Rank_EL` = col_double()))) %>% 
+    map2(alls, ~setNames(.x, c("Peptide", .y))) %>% 
+    reduce(left_join, by = "Peptide") %>% 
+    distinct(Peptide, .keep_all = T) %>% 
+    pivot_longer(cols = !Peptide, names_to = "allele", values_to = "rank") %>% 
+    group_by(Peptide) %>% 
+    slice_min(rank, n=1) %>% 
+    write_tsv(paste0("./Output/netMHCpan_predictions_train/HLA_affinities_",tum,".tsv"))
+}
+```
+
+Define HLA typings per tumor line and run the function.
+
+```{r}
+typings <- list(M026X1 = c("HLA-A0201","HLA-A0101", "HLA-B0801", "HLA-B4402", "HLA-C0501","HLA-C0701"), 
+                SKMEL95 =c("HLA-A0201","HLA-A2402", "HLA-B1801","HLA-B5101","HLA-C0501","HLA-C1601"),
+                NKIRTIL006 = c("HLA-A0201", "HLA-B1501", "HLA-B4402", "HLA-C0501", "HLA-C0304" ))
+
+typings %>% 
+  map2(names(typings), ~write_tumor_files(.x, .y))
+
+```
+
+
+
+## Add scores to test set
+
+```{r}
+train.set <- read_tsv("./Output/test_train_sets/HLA_train_set.tsv")
+
+train.set %>% 
+  rename(Peptide = "peptide") %>% 
+  nest(data = !tumor) %>% 
+  mutate(peptide.affinities = map(paste0("./Output/netMHCpan_predictions_train/HLA_affinities_",tumor,".tsv"), read_tsv)) %>% 
+  mutate(data2 = map2(data, peptide.affinities, ~left_join(.x, .y, by = c("Peptide")))) %>% 
+  select(data2, tumor) %>% 
+  unnest(data2) %>% 
+  group_by(tumor) %>% 
+  distinct(Peptide, .keep_all = T) -> train.set.new
+
+write_tsv(train.set.new, "./Output/test_train_sets/HLA_train_set_complete.tsv")
+```
+
+
