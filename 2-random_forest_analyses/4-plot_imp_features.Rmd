@@ -1,0 +1,370 @@
+---
+title: "Visualizing the importance of features"
+author: "Kaspar Bresser"
+date: "18/02/2024"
+
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+#    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+#                     comment = NA,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+In these I analysis I'll try to visualize features that were identified to be important by the individually fitted randomforest models. 
+
+```{r loading}
+library(tidyverse)
+library(rstatix)
+library(tidytext)
+```
+
+## Import data and tidy
+
+Import the peptides used to train the models, down-sample decoy peptides to the same amount as the MS-detected peptides (3389) for each tumor. 
+
+```{r import_data}
+train.peptides <- read_tsv("Output/test_train_sets/HLA_train_set_complete.tsv")
+tumor.order <- c("SKMEL95", "M026X1", "NKIRTIL006")
+
+train.peptides %>% 
+  group_by(tumor, ligand) %>% 
+  nest() %>% 
+  ungroup() %>% 
+  mutate(sample.size =  rep(c(13556, 3389), 3)) %>% 
+  mutate(data = map2(data, sample.size, sample_n)) %>% 
+  select(-sample.size) %>% 
+  unnest(data) -> train.peptides
+
+train.peptides
+```
+
+
+Import the important features and the entire feature table.
+
+The `imp.features` table contains the top features, based on summed importance score over the three lines. 
+
+Features table contains a lot of `NA`'s, replace these with 0's, and select only the important features.
+
+
+```{r import_features}
+imp.features <- read_tsv("Output/top_important_features.tsv")
+
+features <- read_tsv("Data/Protein_per_Uniprot_entry_library_v3.csv.zip")
+
+features %>% 
+  select(one_of("Entry", imp.features$feature)) %>% 
+  mutate(across(everything(), replace_na, 0 )) -> features
+```
+
+
+select the top 10 features for each class.
+
+
+```{r get_focus}
+imp.features %>%
+  group_by(classes) %>% 
+  slice_max(order_by = score, n = 10) %>% 
+  pull(feature) -> focus.features 
+
+focus.features
+```
+
+subset the feature table, join with the peptide table, switch to long, and add feature types
+
+```{r tidy_data}
+features %>%
+  select(one_of("Entry", focus.features)) %>%  
+  inner_join(train.peptides, by =  c("Entry" = "swissprot_id")) %>% 
+  pivot_longer(cols = one_of(focus.features), names_to = "feature", values_to = "value") %>%
+  mutate(feature = factor(feature, levels = focus.features)) %>% 
+  mutate(feature.type = case_when(str_detect(feature, "UTR5") ~ "UTR5",
+                                  str_detect(feature, "UTR3") ~ "UTR3",
+                                  str_detect(feature, "count") ~ "count",
+                                  str_detect(feature, "CDS") ~ "CDS",
+                                  str_detect(feature, "hsa") ~ "miR",
+                                  TRUE ~ "misc")) -> plot.data
+
+plot.data
+```
+
+
+
+## T test
+
+To specifically select a couple features that are significantly associated with HLA sampling, we can do a simple t test. 
+
+Plot the T statistics as barplots, either all together or facetted. 
+
+```{r t_test, fig.width=12,fig.asp=.2 }
+feat.classes <- (c("UTR5","CDS" ,"UTR3","miR",  "count"))
+
+plot.data %>% 
+  group_by(feature) %>% 
+  t_test(value~ligand) %>% 
+  adjust_pvalue(method = "bonferroni") -> stats
+
+stats
+
+
+stats %>% 
+  mutate(feature.type = case_when(str_detect(feature, "UTR5") ~ "UTR5",
+                                  str_detect(feature, "UTR3") ~ "UTR3",
+                                  str_detect(feature, "count") ~ "count",
+                                  str_detect(feature, "CDS") ~ "CDS",
+                                  str_detect(feature, "hsa") ~ "miR",
+                                  TRUE ~ "misc"),
+         feature.type = factor(feature.type, levels = feat.classes),
+           feature = str_remove_all(feature, "UTR5|UTR3|CDS|count|hsa|\\."),
+           feature = str_replace_all(feature, "_", " "),
+           feature = reorder_within(feature, -statistic, feature.type)) %>% 
+  ggplot(aes(x = feature, y = -statistic, fill = p.adj < 0.05))+
+    geom_bar(stat = "identity")+
+    coord_flip()+
+    scale_x_reordered()+
+    theme_minimal()+
+    facet_wrap(~feature.type, scales = "free_y", nrow = 1)
+
+ggsave("Figs/importance_Tstat_facet.pdf", width = 16, height = 2.8)
+
+stats %>% 
+  mutate(feature.type = case_when(str_detect(feature, "UTR5") ~ "UTR5",
+                                  str_detect(feature, "UTR3") ~ "UTR3",
+                                  str_detect(feature, "count") ~ "count",
+                                  str_detect(feature, "CDS") ~ "CDS",
+                                  str_detect(feature, "hsa") ~ "miR",
+                                  TRUE ~ "misc"),
+           feature = str_remove_all(feature, "UTR5|UTR3|CDS|count|hsa|\\."),
+           feature = str_replace_all(feature, "_", " "),
+           feature = reorder_within(feature, -statistic, feature.type)) %>% 
+  write_tsv("Output/Fig_S2B.tsv")
+```
+
+
+```{r T-test_plot, fig.asp=1, fig.width=8}
+stats %>% 
+  ggplot(aes(x = reorder(feature, -statistic), y = -statistic, fill = p.adj < 0.05))+
+    geom_bar(stat = "identity")+
+    coord_flip()+
+    theme_minimal()
+
+ggsave("Figs/importance_Tstat_all.pdf", width = 6, height = 7)
+```
+
+Next we can plot the top and bottom 10 features by t-statistic. 
+
+
+```{r boxplots_significant, fig.width=15, fig.asp=.4}
+stats %>% 
+  filter(dense_rank(statistic) <= 10 | dense_rank(desc(statistic)) <= 10) %>% 
+  pull(feature) %>% 
+  fct_drop() -> feats
+
+plot.data %>% 
+  mutate(tumor = factor(tumor, levels = tumor.order)) %>% 
+  filter(feature %in% feats) %>% 
+  ggplot(aes(tumor, log10(value+1), fill = ligand))+
+  geom_boxplot()+
+  facet_wrap(~feature, nrow = 2, scales = "free")+
+  theme_classic()
+
+ggsave(("Figs/importance_boxplots.pdf"), width = 12, height = 4, scale = 1.5)
+
+plot.data %>% 
+  filter(feature %in% feats) %>% 
+    write_tsv("Output/Fig2D.tsv")
+```
+
+
+## HLA ligand enrichment
+
+Was looking for other ways to visualize whether the values of a feature would allow one to enrich for MS detected peptides. One way to do this could be to count the amount of HLA ligands present in the top 50% peptides after sorting for each feature. As a control, I can calculate the same metric after randomly permuting that feature. I can subsequently plot the difference between the actual and control setting.
+
+Achieved this with the bit of code below; Adding a column where each feature is permuted, and a column of random values which I can use later on for tie breaking. Then nest to get separate tibbles for each feature and tumor. Then arrange these tibbles by feature value and tie-breaker, slice off 50% of the columns, calculate the amount of HLA ligands, and pull those values. Do the sample for the permuted control column. 
+
+
+bootstrapped this analysis. I added some lines to subset 30% of the data during each loop.
+
+
+```{r calculate_PPV}
+df.list <- list()
+for(i in 1:50){
+  plot.data %>% 
+    select(ligand, feature, value, tumor, feature.type) %>% 
+    group_by(feature, tumor, feature.type) %>%
+    mutate(random = sample(value, n()),
+           for.arrange = 1:n()) %>% 
+    nest() %>%          
+    mutate(PPV = map(data, ~sample_frac(., size = .3)),
+           control = PPV,
+           PPV = map(PPV, ~arrange(., desc(value))),
+           PPV = map(PPV, ~slice_head(.,prop =  .5)),
+           PPV = map(PPV, ~summarise(., PPV = sum(ligand))),
+           PPV = map_dbl(PPV, pull, PPV),
+           control = map(control, ~arrange(., desc(random))),
+           control = map(control, ~slice_head(.,prop =  .5)),
+           control = map(control, ~summarise(., PPV = sum(ligand))),
+           control = map_dbl(control, pull, PPV)) %>%
+    mutate(difference = PPV-control,
+           perc.difference = ((PPV-control)/control)*100) %>% 
+    rename_with(~paste0(., i), contains("difference")) %>% 
+    select(!c(data, PPV, control)) -> PPV.data
+  
+  df.list[[i]] <- PPV.data
+}
+
+PPV.data <- reduce(df.list, inner_join, by = c("feature", "tumor", "feature.type"))
+```
+
+
+Plot that data as bar plot, and each individual run as points. 
+
+```{r plot_PPV_dots, fig.width=15, fig.asp=.25}
+PPV.data %>% 
+  pivot_longer(cols = starts_with("perc."), names_to = "replicate", values_to = "difference") %>% 
+  group_by(feature.type) %>% 
+  group_split() -> to.plot
+
+PPV.data %>% 
+  pivot_longer(cols = starts_with("perc."), names_to = "replicate", values_to = "difference") %>% 
+  select(feature, tumor, feature.type, replicate, difference) %>% 
+  write_tsv( "Fig2EF.tsv")
+
+map(to.plot, ~ggplot(., aes(x = tumor, y = difference, fill = tumor))+
+                geom_bar(position = "dodge", stat = "summary", fun = "median")+
+                geom_point(position = position_jitterdodge() )+
+                facet_wrap(~feature, nrow = 1))
+```
+
+
+Or plot as barplot, adding the the confidence interval.
+
+
+```{r plot_PPV_error, fig.width=14, fig.asp=.35}
+
+PPV.data %>% 
+  mutate(tumor = factor(tumor, levels = tumor.order)) %>% 
+  pivot_longer(cols = starts_with("perc."), names_to = "replicate", values_to = "diff") %>% 
+  group_by(feature, feature.type, tumor) %>% 
+  summarise(difference = mean(diff), stdev = sd(diff), n=n()) %>% 
+  mutate(se = stdev/sqrt(n)) %>%
+  mutate(ic = se * qt((1-0.05)/2 + .5, n-1)) %>% 
+  group_by(feature, feature.type) %>% 
+  mutate(group.mean = mean(difference)) %>% 
+  mutate(feature.label = str_replace_all(feature, "_", " "),
+         feature.label = str_remove(feature.label, feature.type),
+         feature.type = factor(feature.type, levels = feat.classes),
+         feature = reorder_within(feature, group.mean, feature.type)) -> to.plot
+
+ggplot(to.plot, aes(x = reorder(feature, group.mean), y = difference, fill = tumor,  
+                    ymin=difference-ic, ymax=difference+ic))+
+  geom_bar( stat="identity", color = "black", position = "dodge") +
+  geom_errorbar(  position=position_dodge(width=0.9), width = .3)+
+  geom_hline(yintercept = 0)+
+  facet_wrap(~feature.type, scales = "free", nrow =1)+
+  coord_flip()+
+  scale_x_reordered()+
+  theme_classic()+
+  theme(panel.grid.major.x = element_line())
+
+ggsave("Figs/importance_enrichment_final.pdf", width = 150, height = 35, units = "mm", scale = 2.5)
+```
+
+
+
+```{r compare_imp2}
+to.plot %>% 
+  group_by(feature, feature.type) %>% 
+  summarise(mean.difference = mean(difference)) %>% 
+  ggplot(aes(reorder(feature.type, abs(mean.difference)), abs(mean.difference), color = feature.type))+
+  geom_boxplot(outlier.shape = NA, size = 1)+
+  geom_jitter(width = .15, color = "black")+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+to.plot %>% 
+  group_by(feature, feature.type) %>% 
+  summarise(mean.difference = mean(difference)) %>% 
+  ggplot(aes(reorder(feature.type, abs(mean.difference)), abs(mean.difference)))+
+  geom_boxplot(outlier.shape = NA, size = 0.5)+
+  geom_jitter(shape = 21, width = .15, size = 2.0, aes( fill = feature.type))+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave("Figs/importance_enrichment_classes_box_final.pdf", width = 4, height = 3)
+
+```
+
+
+
+
+
+
+
+## Plot AUC graphs
+
+```{r}
+plot.data %>% 
+  select(feature, value, ligand, tumor, feature.type) %>% 
+  group_by(feature, tumor) %>% 
+  arrange(desc(value)) %>% 
+  mutate(peptides = 1:n()/n(), ligands_found = cumsum(ligand)/sum(ligand)) -> cumsum.dat
+```
+
+```{r}
+library(bayestestR)
+cumsum.dat %>% 
+  group_by(feature, tumor, feature.type) %>% 
+   summarise(auc = area_under_curve(peptides, ligands_found)) -> auc.dat
+```
+
+
+
+```{r fig.asp=.3, fig.width = 12}
+t_shift <- scales::trans_new("shift",
+                             transform = function(x) {x-.5},
+                             inverse = function(x) {x+.5})
+
+feat.classes <- (c("UTR5","CDS" ,"UTR3","miR",  "count"))
+
+
+
+auc.dat %>% 
+  mutate(tumor = factor(tumor, levels = tumor.order),
+         feature.type = factor(feature.type, levels = feat.classes)) %>% 
+  group_by(tumor) %>% 
+  mutate(feature = str_remove_all(feature, "UTR5|UTR3|CDS|count|hsa|\\."),
+         feature = str_replace_all(feature, "_", " ")) %>% 
+  mutate(feature = reorder_within(feature, auc, feature.type)) %>% 
+  ggplot(aes(x = feature, y = auc, fill = tumor))+
+    geom_bar(stat = "identity", position = "dodge")+
+    facet_wrap(~feature.type, scales = "free_y", nrow = 1)+
+    coord_flip()+
+    scale_y_continuous(trans = t_shift)+
+    scale_x_reordered()+
+    geom_hline(yintercept = .5)+
+    theme_classic()+
+    theme(panel.grid.major.x = element_line(), legend.position = "right")
+
+
+ggsave("./Figs/AUC_plots.pdf", units = "mm", width = 135, height = 35, scale = 2)
+```
+

@@ -1,0 +1,271 @@
+---
+title: "Investigate importance of features"
+author: "Kaspar Bresser"
+date: "11/02/2024"
+
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+#                     comment = NA,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+Used the analysis below to investigate the importance of the different variables as determined by random forest models. 
+
+```{r loading}
+library(tidyverse)
+library(tidytext)
+library(caret)
+library(pheatmap)
+library(RColorBrewer)
+library(ggrepel)
+```
+
+# Import and tidy data
+
+Import the results table. This table stores the different RandomForest models, plus information of the tumor and the feature class to which the model was fitted. 
+
+```{r import_results}
+rf.results <- read_rds("Output/RF_per_tumor_new.rds")
+
+
+rf.results <- mutate(rf.results, tumor = fct_collapse(tumor, M026X1 = c("M026X1","M026.X1"), SKMEL95 =c("SK-MEL-95","SKMEL95")))
+```
+
+
+# check metrics
+
+Extract the results of each model, 
+
+```{r get_metrics}
+rf.results %>% 
+  transmute(metrics = map(rf.models, "results"), tumor = tumor, classes = classes) %>% 
+  unnest(metrics) %>% 
+  pivot_longer(2:9, names_to = "metric", values_to = "value") %>%
+  mutate(which = case_when(str_detect(metric, "SD") ~ "SD",
+                           TRUE ~ "value"),
+         metric = str_remove(metric, "SD")) %>% 
+  pivot_wider(names_from = which, values_from = "value") -> to.plot
+
+write_tsv(to.plot, "Output/Fig_S2a.tsv")
+
+to.plot <- read_tsv( "Output/Fig_S2a.tsv")
+
+to.plot
+```
+
+
+```{r plot_metrics, fig.width=12, fig.asp=.25}
+tumor.order <- c("SKMEL95", "M026X1", "NKIRTIL006")
+
+to.plot %>% 
+  mutate(tumor = factor(tumor, levels = tumor.order)) %>% 
+ggplot( aes(x=classes, y=value, fill=tumor)) + 
+  geom_bar(stat="identity", color="black", position=position_dodge()) +
+  geom_errorbar(aes(ymin=value, ymax=value+SD), width=.2,
+                 position=position_dodge(.9))+
+  facet_wrap(~metric, scales = "free_y", nrow = 1)+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave("Figs/importance_model_metrics.pdf", width = 100, height = 20, units = "mm", scale = 4)
+```
+
+
+# Check importance
+
+Extract the importance information from the models, and unnest into long format. 
+
+```{r get_importance}
+rf.results %>% 
+  mutate(importance = map(rf.models, varImp, scale = T),
+         importance = map(importance, "importance"),
+         importance = map(importance, as_tibble, rownames = "feature")) %>% 
+  select(tumor, classes, importance) %>% 
+  unnest(importance ) %>% 
+  select(-no) %>% 
+  rename(importance = yes) -> importance.table
+
+rm(rf.results)
+gc()
+
+write_tsv(importance.table, "Output/rf_importance.tsv")
+
+importance.table <- read_tsv( "Output/rf_importance.tsv")
+
+importance.table
+```
+
+
+```{r plot_dist, fig.width=8}
+ggplot(importance.table, aes(x = importance))+
+  geom_histogram(binwidth = 1)+
+  facet_grid(tumor~classes,  scales = "free_y")+
+  geom_vline(xintercept = 20, linetype = "dashed")
+```
+
+```{r plot_dist2, fig.width=8}
+ggplot(importance.table, aes(x = classes, y = importance, fill = tumor))+
+  geom_boxplot()
+```
+
+
+# Homogenicity with barplots
+
+Want to focus on a few top features to plot, lets select the top 40 most important features across the tumor lines. Used the sum of the 3 lines to get the features that had a high score in at least two of the lines. 
+
+```{r get_top}
+importance.table %>% 
+  group_by(classes, feature) %>% 
+  summarise(score = sum(importance)) %>% 
+  slice_max(score, n = 40) -> top.important
+
+write_tsv(top.important, "Output/top_important_features.tsv")
+
+importance.table %>% 
+  group_by(classes, feature) %>% 
+  summarise(score = sum(importance)) %>% 
+  slice_max(score, n = 10) -> top10.important
+```
+
+Plot as barcharts.
+
+```{r plot_bar, fig.asp=1.8, fig.width=10}
+importance.table %>% 
+  semi_join(top.important) %>% 
+  group_by(tumor) %>% 
+  mutate(feature = reorder(feature, importance)) %>% 
+  ggplot(aes(feature, importance, fill = tumor))+
+    geom_bar(stat = "identity", position = "dodge")+
+    facet_wrap(~classes, scales = "free", nrow = 2)+
+    coord_flip()
+```
+
+
+```{r plot_bar_fig, fig.asp=.3, fig.width=12}
+importance.table %>% 
+  semi_join(top10.important) %>% 
+  group_by(tumor) %>% 
+  mutate(feature = str_remove_all(feature, "UTR5|UTR3|CDS|count|hsa|\\."),
+         feature = str_replace_all(feature, "_", " ")) %>% 
+  mutate(feature = reorder_within(feature, importance, classes)) %>% 
+  ggplot(aes(feature, importance, fill = tumor))+
+    geom_bar(stat = "identity", position = "dodge")+
+    facet_wrap(~classes, scales = "free", nrow = 1)+
+    coord_flip()+
+    scale_x_reordered()+
+    theme_classic()+
+    theme(panel.grid.major.x = element_line())
+
+ggsave(("Figs/importance_importance.pdf"), width = 12, height = 3)
+```
+
+# Correlations between lines
+
+Use GGally's ggpairs function to check correlations between the tumor lines. 
+
+```{r cor_plots, fig.width=10}
+library(GGally)
+library(ggpubr)
+
+importance.table %>% 
+  pivot_wider(names_from = tumor, values_from = importance) %>% 
+  ggpairs(columns = 3:5, aes(color = classes))+
+  theme_classic()
+
+ggsave(("Figs/importance_ggpairs.pdf"), width = 6, height = 6)
+```
+
+Visualization isn't great, let's plot the different comparisons for each class as individual scatterplots. 
+
+```{r class_cor_plots, fig.width=8}
+comps <- list(c("SKMEL95", "NKIRTIL006"), c("M026X1", "NKIRTIL006"), c("M026X1", "SKMEL95"))
+
+
+importance.table %>% 
+  pivot_wider(names_from = tumor, values_from = importance) -> to.plot
+
+plots <- map(comps, ~ggplot(to.plot, aes_string(x = .[[1]], y = .[[2]]))+
+                      geom_point()+
+                      geom_smooth(aes(color = classes), method = "lm")+
+                      facet_wrap(~classes, nrow = 1)+
+                      theme_bw())
+
+ggarrange(plotlist = plots, ncol = 1, nrow = 3, common.legend = T)
+
+ggsave(("Figs/importance_scatter.pdf"), width = 10, height = 6)
+
+write_tsv(to.plot, "./Output/Fig2C.tsv")
+```
+
+Same, but log10 transformed
+
+```{r class_corrr_plots_log10, fig.width=8}
+importance.table %>% 
+  mutate(importance = log10(importance+1)) %>% 
+  pivot_wider(names_from = tumor, values_from = importance, values_fill = 0)  -> to.plot-> to.plot
+
+plots <- map(comps, ~ggplot(to.plot, aes_string(x = .[[1]], y = .[[2]]))+
+                      geom_point()+
+                      geom_smooth(aes(color = classes), method = "lm")+
+                      facet_wrap(~classes, nrow = 1)+
+                      theme_bw())
+
+ggarrange(plotlist = plots, ncol = 1, nrow = 3, common.legend = T)
+
+ggsave(("Figs/importance_scatter_log10.pdf"), width = 10, height = 6)
+
+ggsave(("Figs/importance_scatter_log10_mm.pdf"), width = 70, height = 60, units = "mm", scale = 3)
+```
+
+
+
+
+# Average importance plots
+
+Calculate mean importance across tumor lines, simplify feature names, and reorder. Log10 transform the importance metric. 
+
+```{r importance_plots, fig.width=12, fig.asp=.3}
+importance.table %>% 
+  group_by(classes, feature) %>% 
+  summarise(importance = mean(importance)) %>% 
+  mutate(feature = str_remove_all(feature, "UTR5|UTR3|CDS|count|hsa|\\."),
+         feature = str_replace_all(feature, "_", " ")) %>% 
+  mutate(feature.reordered = reorder_within(feature, importance, classes)) -> to.plot
+
+
+ggplot(to.plot, aes(x = feature.reordered, y = log10(importance), label = feature))+
+    geom_point()+
+    facet_wrap(~classes, scales = "free_x", nrow = 1)+
+    theme_classic()+
+    geom_point(data = slice_max(to.plot, importance, n = 10 ), color = "darkred")+
+    geom_text_repel(data = slice_max(to.plot, importance, n = 10 ), 
+                    box.padding = 1.4, max.overlaps = 25, color = "darkred", size = 4)+
+    theme(axis.text.x=element_blank(),
+          axis.ticks.x=element_blank(), panel.grid.major.y = element_line())
+
+ggsave(("Figs/importance_dotplots.pdf"), width = 122, height = 30, units = "mm", scale = 4)
+
+
+write_tsv(to.plot, "./Output/Fig2B.tsv")
+```
+
