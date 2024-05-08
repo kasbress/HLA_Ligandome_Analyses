@@ -1,0 +1,260 @@
+---
+title: "Generate peptide database"
+author: "Kaspar Bresser"
+date: "22/03/2024"
+
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+#    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      eval = FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+#                     comment = NA,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+```{r startup, eval=TRUE}
+library(babelgene)
+library(tidyverse)
+library(furrr)
+```
+
+# Lung data peptide select
+
+## Import ligands
+
+
+```{r check_sheets, eval=TRUE}
+MS.data <- read_tsv("Output/Melanoma_train_set_complete.tsv")
+```
+
+
+
+```{r import_ligand_data, eval=TRUE}
+tumors <- unique(MS.data$tumor)
+
+MS.data %>% 
+  transmute(sequence = Peptide, swissprot.id = swissprot_id, tumor = tumor) %>% 
+  na.omit() %>% 
+  distinct(sequence, tumor, .keep_all = T) -> MS.data
+
+MS.data %>% count(tumor)
+
+```
+
+
+
+
+
+Tidy up, and add peptide lengths.
+
+```{r tidy_broad_data, eval=TRUE}
+MS.data %>% 
+  mutate(pep.length = str_length(sequence))  -> MS.data
+
+MS.data
+```
+
+Check the amount of 9mers for each allele. 
+
+```{r check_9mers, eval=TRUE}
+pep.lengths <- count(MS.data, tumor, pep.length)
+
+pep.lengths %>% 
+  filter(pep.length %in% 8:12) %>% 
+ggplot( aes(x = pep.length, y = n, color = tumor))+
+  geom_line()
+```
+
+
+Write out the table and peptide files
+
+```{r, echo=FALSE}
+MS.data %>% 
+  transmute(pep.len = paste0(nchar(sequence), "AA"), sequence = sequence, tumor = tumor) %>% 
+  unite("info", tumor, pep.len) %>% 
+  nest(data = sequence) %>% 
+  mutate(peptides = map(data, pull, sequence),
+         peptides = set_names(peptides, info)) %>% 
+  pull(peptides) %>% 
+  map2(names(.), ~write_lines(.x, paste0("./Output/Melanoma/peptides/Melanoma_Peptides_", .y, ".tsv")))
+
+write_tsv(MS.data, "./Output/Melanoma/Melanoma_Train_Table.tsv")
+```
+
+
+## Run netMHCpan
+
+Get the file names
+
+```{r}
+files <- list.files("Output/Melanoma/peptides", pattern = "Melanoma_Pep", full.names = T)
+
+files
+```
+
+
+```{r}
+HLA.alleles <- list(M026X1 = c("A0201","A0101", "B0801", "B4402", "C0501","C0701"), 
+                    SKMEL95 =c("A0201","A2402", "B1801","B5101","C0501","C1601"),
+                    NKIRTIL006 = c("A0201", "B1501", "B4402", "C0501", "C0304" ))
+```
+
+
+Run system command for netMHCpan, for each allele. Define function to get the arguments/flags for netMHCpan
+
+
+```{r}
+args_netMHC <- function(allele, file.name, peptide.len){
+  c(
+    paste0("-a HLA-", sub("(.{3})(.*)", "\\1:\\2", allele)),
+    paste0("-f ", file.name),
+    "-p",
+    "-rth 0.0",
+    "-rlt 0.0",
+    paste0("-l ", peptide.len),
+    "-t -100",
+    "-inpfmt 0"
+  )
+}
+
+```
+
+wrapper function to predict for each length
+
+```{r}
+netMHC_wrapper <- function(tum, len){
+  
+  file.name <- paste0("Output/Melanoma/peptides/Melanoma_Peptides_", tum, "_", len, "AA.tsv")
+  all.alleles <- HLA.alleles[[tum]]
+  
+  future_map(all.alleles, ~system2(command = "netMHCpanExp", 
+                      args = args_netMHC(., file.name, len), 
+                      stdout  = paste0("./Output/Melanoma/netMHCpanExp_predictions/netMHCpan_prediction_",tum, "_", .,
+                                      "_", len , "AA_yay.txt")))
+}
+```
+
+Run netMHCpan, parallel for the alleles 
+
+```{r}
+plan(multisession, workers = 6)
+
+
+map2(rep(tumors, 3), rep(9:11, each = 3), ~netMHC_wrapper(.x, .y))
+```
+
+
+### Cleanup and combine per tumor
+
+Define function to read in predictions for each peptide length, cleanup the netMHC output, and combine them in a single tsv file
+
+```{r}
+combine_and_clean <- function(tum){
+
+  file.list <- list.files("./Output/Melanoma/netMHCpanExp_predictions/", pattern = tum, full.names = T)
+
+  file.list %>% 
+    map(read_lines) %>% 
+    map(~.[grepl("   1 HLA", .)]) %>% 
+    unlist() %>% 
+    c(" Pos         MHC        Peptide      Core Of Gp Gl Ip Il        Icore        Identity  Score_EL %Rank_EL Exp", .) %>% 
+    write_lines(paste0("./Output/Melanoma/netMHCpanExp_predictions_clean/", tum,".tsv"))
+  
+  gc()
+}
+```
+
+
+Apply the function for each allele
+
+```{r}
+
+map(tumors, combine_and_clean)
+```
+
+
+### Finalize files
+
+Write a function that reads in the allele predictions per tumor line, only imports the columns needed, joins them together, and selects the highest affinity rank.
+
+```{r}
+write_tumor_files <- function(fil){
+ tum <- str_split_i(fil, "\\/|\\.", 4)
+  fil %>% 
+    read_table() %>% 
+    distinct(Peptide, MHC, .keep_all = T) %>% 
+    transmute(allele = str_remove_all(MHC, "HLA-|\\*|\\:"), sequence = Peptide, rank = `%Rank_EL`) %>% 
+    group_by(sequence) %>% 
+    slice_min(rank, n=1) %>% 
+    write_tsv(paste0("./Output/Melanoma/netMHCpanExp_predictions_clean/HLA_affinities_",tum,".tsv"))
+}
+```
+
+Define HLA typings per tumor line and run the function.
+
+```{r}
+list.files("Output/Melanoma/netMHCpanExp_predictions_clean", full.names = T)
+map(list.files("Output/Melanoma/netMHCpanExp_predictions_clean", full.names = T), write_tumor_files)
+```
+
+
+
+
+## Final combine data
+
+```{r}
+train.table <- read_tsv("Output/Melanoma_train_set_complete.tsv")
+```
+
+
+
+```{r}
+files <- list.files("Output/Melanoma/netMHCpanExp_predictions_clean", pattern = "HLA", full.names = T)
+
+files %>% 
+  map(read_tsv) %>% 
+  set_names(str_split_i(files, "\\_|\\.", 5)) %>% 
+  map2(names(.), ~mutate(.x, tumor = .y)) %>% 
+  reduce(bind_rows) %>% 
+  mutate(tumor = as.character(tumor)) %>% 
+  select(-allele) %>% 
+  rename(rankExp = rank) -> netMHCranksExp
+```
+
+
+```{r}
+train.table %>% 
+  left_join(netMHCranksExp, by = c("Peptide" = "sequence", "tumor" = "tumor")) %>% 
+  na.omit() -> train.table
+
+train.table %>% 
+  count(tumor, ligand)
+```
+
+
+
+```{r}
+write_tsv(train.table, "Output/Melanoma_Train_Table_all.tsv")
+```
+
+
+
+
