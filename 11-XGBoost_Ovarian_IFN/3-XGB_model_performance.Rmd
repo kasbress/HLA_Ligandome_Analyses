@@ -1,0 +1,196 @@
+---
+title: "XGB results top 0.1% Ovarian"
+author: "Kaspar Bresser"
+date: "28/03/2024"
+
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+#    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+#                     comment = NA,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+Used the analysis below to compare the performance of the XGB models.
+
+```{r loading}
+library(bayestestR)
+library(tidyverse)
+library(rstatix)
+library(ggpubr)
+library(pROC)
+```
+
+## Import and tidy data
+
+Import the results table.
+
+```{r import_results}
+XGB.results <- read_tsv("./Output/all_predictions_ovarian.tsv")
+```
+
+Convert the ligand column to a binary so it can be used for cumsum calculation, pivot to longer data by putting the models in a grouped format.
+
+```{r prep_data}
+XGB.results %>% 
+  mutate(rank = -rank) %>% 
+  mutate(detected = case_when(ligand == TRUE ~ 1,
+                              TRUE ~ 0)) %>% 
+  pivot_longer(cols = !c("detected","ligand", "tumor", "sequence", "swissprot.id"), 
+               names_to =  "model", 
+               values_to =  "score") -> XGB.results
+
+XGB.results
+
+```
+
+
+For these analysis we'll focus on the top 0.1% scoring peptides for each model. Let's subset on those. Note that I arrange on both both model scores and a random number for tie breaking.
+
+Next we'll calculate the cumulative sums by grouping by allele and model. 
+
+Note that `cumsum()` takes an ordered dataframe. 
+
+```{r data_prep3}
+XGB.results %>% 
+  group_by(tumor, model) %>% 
+  mutate(random = sample(1:n())) %>% 
+  arrange(desc(score), random, .by_group = T) %>% 
+    mutate(peptides = 1:n()/n(), 
+         detected_ligands = cumsum(detected)/sum(detected)) %>% 
+  slice_head(prop = .001) -> XGB.results
+ 
+XGB.results
+```
+
+
+
+
+Lastly, set the ordering in which we'd like the models to appear in plots, by converting the models variable to a factor
+
+```{r data_prep4}
+unique(XGB.results$model)
+
+model.order <- c("aff_only", "aff_lib_small","aff_lib")
+
+tumor.order <- as.character(unique(XGB.results$tumor))
+
+colors <- c("#6BAED6", "#756CB1", "#5F3D8C")
+
+XGB.results %>% 
+  filter(model %in% model.order) %>% 
+  mutate(model = as_factor(model),
+         model = fct_relevel(model, model.order),
+         tumor = as_factor(tumor),
+         tumor = fct_relevel(tumor, tumor.order)) %>% 
+  separate(tumor, into = c("treatment", "tumor")) -> XGB.results
+
+XGB.results
+```
+
+
+## Positive predictive value
+
+Lets first plot the positive predictive value (PPV), i.e. the number of true positives within a certain threshold. Calculate the PPV as the number of true positives divided by the total number of peptides within the selected pool.
+
+
+
+```{r}
+XGB.results %>%  
+  group_by(tumor, treatment, model) %>% 
+  mutate(model = fct_drop(model)) %>% 
+  summarise(PPV = sum(detected)/n()) %>% 
+  ungroup() %>% 
+  group_by(treatment) %>% 
+  rstatix::t_test(PPV ~ model, paired = T) %>% 
+  add_xy_position(x = "model",  fun = "max", step.increase = 0.04) %>% 
+  mutate(p.adj = round(p.adj, 3))-> stats
+
+```
+
+
+
+```{r PVV_plot_increment, fig.width=5, fig.asp=.85}
+library(lemon)
+
+XGB.results %>%  
+  group_by(tumor, treatment, model) %>% 
+  summarise(PPV = sum(detected)/n()) %>% 
+   ggplot( aes(x = model, y = PPV, group = tumor)) +
+    geom_boxplot(aes(group = model), width = 0.585)+
+    geom_line()+
+    geom_point(aes(fill = model), shape = 21, size = 3.25 )+
+    facet_rep_wrap(~treatment)+
+    scale_fill_manual(values = colors, labels = c("Aff", "Aff+Lib", "Aff+Lib 2.0"))+
+    stat_pvalue_manual(stats, label = "p.adj", 
+                     tip.length = 0.00, hide.ns = F, label.size = 2 )+
+    ggtitle("PPV in top 0.1%")+
+    theme_classic()+
+    theme(plot.title = element_text(hjust = 0.5), 
+          panel.grid.major.y = element_line(), axis.text.x=element_blank(), legend.position = "bottom",)
+
+ggsave("Figs/XGB_PPV_strip.pdf", width = 3.2, height = 3.2, scale = 1.2)
+```
+
+
+## Area under the curve
+
+Or calculate the AUC of these curves as a summary metric and plot that. Used the `area_under_curve()` function from the [bayestestR](https://easystats.github.io/bayestestR/index.html) package. 
+
+
+
+```{r}
+XGB.results %>% 
+  group_by(tumor, treatment, model) %>% 
+  summarise(auc = area_under_curve(peptides, detected_ligands)*1000) %>% 
+  mutate(model = fct_drop(model)) %>%
+  group_by(treatment) %>% 
+  rstatix::t_test( auc ~ model, paired = T) %>% 
+  add_xy_position(x = "model", step.increase = 0.04) %>% 
+  mutate(p.adj = round(p.adj, 4)) -> stats
+
+stats
+```
+
+
+```{r PVV_plot_increment2, fig.width=5, fig.asp=.85}
+XGB.results %>% 
+  group_by(tumor, treatment, model) %>% 
+  summarise(auc = area_under_curve(peptides, detected_ligands)*1000) %>% 
+    ggplot( aes(x = model, y = auc, group = tumor)) +
+    geom_boxplot(aes(group = model), width = 0.585)+
+    geom_line()+
+    geom_point(aes(fill = model), shape = 21, size = 3.25 )+
+   facet_rep_wrap(~treatment)+
+    scale_fill_manual(values = colors, labels = c("Aff", "Aff+Lib", "Aff+Lib 2.0"))+
+    stat_pvalue_manual(stats, label = "p.adj", 
+                     tip.length = 0.00, hide.ns = F, label.size = 2 )+
+    ggtitle("AUC in top 0.1%")+
+    theme_classic()+
+    theme(plot.title = element_text(hjust = 0.5), 
+          panel.grid.major.y = element_line(), axis.text.x=element_blank(), legend.position = "bottom",)
+
+ggsave("Figs/XGB_AUC_strip.pdf", width = 3.2, height = 3.2, scale = 1.2)
+```
+
+
+
+
