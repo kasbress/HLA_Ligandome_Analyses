@@ -1,0 +1,506 @@
+---
+title: "XGB results top 0.1%"
+author: "Kaspar Bresser"
+date: "28/02/2024"
+
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+#    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+#                     comment = NA,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+Used the analysis below to compare the performance of the XGB models.
+
+```{r loading}
+library(bayestestR)
+library(tidyverse)
+```
+
+## Import and tidy data
+
+Import the results table.
+
+```{r import_results}
+XGB.results <- read_tsv("./Output/all_predictions_new.tsv")
+```
+
+Convert the ligand column to a binary so it can be used for cumsum calculation, pivot to longer data by putting the models in a grouped format.
+
+```{r prep_data}
+XGB.results %>% 
+  mutate(detected = case_when(ligand == TRUE ~ 1,
+                              TRUE ~ 0)) %>% 
+  mutate(rank = -rank) %>% 
+  pivot_longer(cols = !c("detected", "ligand", "tumor", "swissprot_id", "Peptide", "allele"), 
+               names_to =  "model", 
+               values_to =  "score") -> XGB.results
+
+XGB.results
+```
+
+
+For these analysis we'll focus on the top 0.1% scoring peptides for each model. Let's subset on those. Note that I arrange on both both model scores and a random number for tie breaking.
+
+
+
+Next we'll calculate the cumulative sums by grouping by tumor and model. 
+
+Note that `cumsum()` takes an ordered dataframe. 
+
+
+```{r data_prep3}
+XGB.results %>% 
+  group_by(tumor, model) %>% 
+  mutate(random = sample(1:n())) %>% 
+  arrange(desc(score), random, .by_group = T) %>% 
+    mutate(peptides = 1:n()/n(), 
+         detected_ligands = cumsum(detected)/sum(detected)) %>% 
+  slice_head(prop = .001) -> XGB.results
+
+```
+
+
+
+Lastly, set the ordering in which we'd like the models to appear in plots, by converting the models variable to a factor
+
+```{r data_prep4}
+unique(XGB.results$model)
+unique(XGB.results$tumor)
+
+model.order <- c("aff_only", "aff_lib", "aff_lib_small", "aff_lib_small_rna", "aff_rna","aff_ribo","aff_rna_ribo",
+                 "aff_lib_small_ribo", "aff_lib_small_rna_ribo")
+
+
+tumor.order <- c("SKMEL95", "M026X1","NKIRTIL006")
+
+XGB.results %>% 
+  mutate(model = as_factor(model),
+         model = fct_relevel(model, model.order),
+         tumor = factor(tumor, levels = tumor.order)) %>% 
+  filter(model %in% model.order) -> XGB.results
+
+XGB.results
+```
+
+
+## Positive predictive value
+
+Lets first plot the positive predictive value (PPV), i.e. the number of true positives within a certain threshold. Calculate the PPV as the number of true positives divided by the total number of peptides within the selected pool.
+
+Plot improvement gained with library:
+
+```{r PVV_plot_bars_core, fig.width=6}
+core.models <- c("aff_only", "aff_lib", "aff_lib_small")
+#colors <- c("#27aae1", "#6675b8", "#834e9f", "#2bb673", "#2e7a3c", "cyan3", "cyan4")
+colors <- c("#6BAED6", "#9E9AC8", "#756BB1")
+
+XGB.results %>%  
+  filter(model %in% core.models) %>% 
+  group_by(tumor, model) %>% 
+  summarise(PPV = sum(detected)/n()) %>% 
+ggplot( aes(x = tumor, y = PPV, fill = model)) +
+  geom_bar(stat = "identity", width=0.75, position=position_dodge(width=0.85), color = "black")+
+  ggtitle("PPV in top 0.1%")+
+  scale_fill_manual(values = colors, labels = c("A", "A+SF", "A+SF(trim)"))+
+  ggtitle("PPV in top 0.1%")+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5), panel.grid.major.y = element_line())
+
+ggsave("Figs/XGB_PPV_bar_core.pdf", width = 3, height = 2, scale = 2)
+```
+
+
+```{r PVV_plot_bars_rna, fig.width=6}
+rna.models <- c("aff_only",  "aff_lib_small", "aff_rna","aff_ribo","aff_rna_ribo")
+
+colors <- c("#6BAED6",  "#756BB1", "#74C476", "#31A354" ,"#006D2C")
+
+XGB.results %>%  
+  filter(model %in% rna.models) %>% 
+  group_by(tumor, model) %>% 
+  summarise(PPV = sum(detected)/n()) %>% 
+ggplot( aes(x = tumor, y = PPV, fill = model)) +
+  geom_bar(stat = "identity", width=0.75, position=position_dodge(width=0.85), color = "black")+
+  ggtitle("PPV in top 0.1%")+
+  scale_fill_manual(values = colors, labels = c("A", "A+SF", "A+RNA", "A+RP", "A+RNA+RP"))+
+  ggtitle("PPV in top 0.1%")+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5), panel.grid.major.y = element_line())
+
+ggsave("Figs/XGB_PPV_bar_RNA.pdf", width = 3, height = 2, scale = 2)
+```
+
+
+
+```{r PVV_plot_bars_ribo, fig.width=6}
+sf.models <- c("aff_only",  "aff_lib_small", "aff_lib_small_rna","aff_lib_small_ribo","aff_lib_small_rna_ribo")
+
+colors <- c("#6BAED6",  "#756BB1", "#2171B5", "#08519C" ,"#08306B")
+
+XGB.results %>%  
+  filter(model %in% sf.models) %>% 
+  group_by(tumor, model) %>% 
+  summarise(PPV = sum(detected)/n()) %>% 
+ggplot( aes(x = tumor, y = PPV, fill = model)) +
+  geom_bar(stat = "identity", width=0.75, position=position_dodge(width=0.85), color = "black")+
+  ggtitle("PPV in top 0.1%")+
+  scale_fill_manual(values = colors, labels = c("A", "A+SF", "A+SF+RNA", "A+SF+RP", "A+SF+RNA+RP"))+
+  ggtitle("PPV in top 0.1%")+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5), panel.grid.major.y = element_line())
+
+ggsave("Figs/XGB_PPV_bar_SF.pdf", width = 3, height = 2, scale = 2)
+```
+
+
+
+
+
+```{r PVV_plot_bars_all, fig.width=6}
+sf.models <- c("aff_only",  "aff_rna", "aff_lib_small_rna", "aff_ribo","aff_lib_small_ribo", "aff_rna_ribo","aff_lib_small_rna_ribo")
+
+colors <- c("#6BAED6",  "#74C476", "#2171B5","#31A354", "#08519C", "#006D2C","#08306B")
+
+XGB.results %>%  
+  filter(model %in% sf.models) %>% 
+  mutate(model = factor(model, levels = sf.models)) %>% 
+  group_by(tumor, model) %>% 
+  summarise(PPV = sum(detected)/n()) %>% 
+ggplot( aes(x = tumor, y = PPV, fill = model)) +
+  geom_bar(stat = "identity", width=0.75, position=position_dodge(width=0.85), color = "black")+
+  ggtitle("PPV in top 0.1%")+
+  scale_fill_manual(values = colors)+
+  ggtitle("PPV in top 0.1%")+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5), panel.grid.major.y = element_line())
+
+ggsave("Figs/XGB_PPV_bar_SF_compared.pdf", width = 3, height = 2, scale = 2)
+```
+
+
+
+
+Can also plot the PPV on a continuous scale across the top 0.1%. 
+
+```{r PPV_continuous_all, fig.width=12, fig.asp=.4}
+colors <- c("#6BAED6", "#9E9AC8", "#756BB1")
+
+XGB.results %>% 
+  filter(model %in% core.models) %>% 
+  group_by(tumor,model) %>% 
+  mutate(PPV = cumsum(detected)/1:n()) %>% 
+  ggplot(aes(x = peptides, y = PPV, color = model))+
+  geom_line(linewidth = 1.2)+
+  scale_color_manual(values = colors)+
+  facet_wrap(~tumor, scales = "free")+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave(("Figs/XGB_PPV_line_core.pdf"), width = 6, height = 2, scale = 2)
+```
+
+
+
+```{r PPV_continuous_all2, fig.width=12, fig.asp=.4}
+colors <- c("#6BAED6",  "#756BB1", "#74C476", "#31A354" ,"#006D2C")
+
+XGB.results %>% 
+  filter(model %in% rna.models) %>% 
+  group_by(tumor,model) %>% 
+  mutate(PPV = cumsum(detected)/1:n()) %>% 
+ggplot(aes(x = peptides, y = PPV, color = model))+
+  geom_line(linewidth = 1.2)+
+  scale_color_manual(values = colors)+
+  facet_wrap(~tumor, scales = "free")+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave(("Figs/XGB_PPV_line_rna.pdf"), width = 6, height = 2, scale = 2)
+```
+
+
+```{r PPV_continuous_all3, fig.width=12, fig.asp=.4}
+sf.models <- c("aff_only",  "aff_lib_small", "aff_lib_small_rna","aff_lib_small_ribo","aff_lib_small_rna_ribo")
+
+colors <- c("#6BAED6",  "#756BB1", "#2171B5", "#08519C" ,"#08306B")
+
+XGB.results %>% 
+  filter(model %in% sf.models) %>% 
+    group_by(tumor,model) %>% 
+  mutate(PPV = cumsum(detected)/1:n()) %>% 
+ggplot(aes(x = peptides, y = PPV, color = model))+
+  geom_line(linewidth = 1.2)+
+  scale_color_manual(values = colors)+
+  facet_wrap(~tumor, scales = "free")+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave(("Figs/XGB_PPV_line_SF.pdf"), width = 6, height = 2, scale = 2)
+```
+
+## Cumulative sums
+
+
+
+Core models:
+
+```{r plot_cumsum_core, fig.width=12, fig.asp=.4}
+colors <- c("#6BAED6", "#9E9AC8", "#756BB1")
+
+
+XGB.results %>% 
+  filter(model %in% core.models) %>% 
+  ggplot(aes(x = peptides, y = detected_ligands, color = model))+
+  geom_line(size = 1.2)+  
+  scale_color_manual(values = colors)+
+  facet_wrap(~tumor, scales = "free")+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave(("Figs/XGB_cumsum_core.pdf"), width = 6, height = 2, scale = 2)
+```
+
+```{r plot_cumsum_core2, fig.width=12, fig.asp=.4}
+colors <- c("#6BAED6",  "#756BB1", "#74C476", "#31A354" ,"#006D2C")
+
+
+XGB.results %>% 
+  filter(model %in% rna.models) %>% 
+  ggplot(aes(x = peptides, y = detected_ligands, color = model))+
+  geom_line(size = 1.2)+  
+  scale_color_manual(values = colors)+
+  facet_wrap(~tumor, scales = "free")+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave(("Figs/XGB_cumsum_rna.pdf"), width = 6, height = 2, scale = 2)
+```
+
+
+```{r plot_cumsum_core3, fig.width=12, fig.asp=.4}
+colors <- c("#6BAED6", "#9E9AC8", "#756BB1")
+colors <- c("#6BAED6",  "#756BB1", "#74C476", "#31A354" ,"#006D2C")
+colors <- c("#6BAED6",  "#756BB1", "#2171B5", "#08519C" ,"#08306B")
+
+
+XGB.results %>% 
+  filter(model %in% sf.models) %>% 
+  ggplot(aes(x = peptides, y = detected_ligands, color = model))+
+  geom_line(size = 1.2)+  
+  scale_color_manual(values = colors)+
+  facet_wrap(~tumor, scales = "free")+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line())
+
+ggsave(("Figs/XGB_cumsum_SF.pdf"), width = 6, height = 2, scale = 2)
+```
+
+
+## Area under the curve
+
+Or calculate the AUC of these curves as a summary metric and plot that. Used the `area_under_curve()` function from the [bayestestR](https://easystats.github.io/bayestestR/index.html) package. 
+First check maximum AUC to normalize between 0 and 1.
+
+
+
+Core models:
+
+```{r plot_auc_core1, fig.width=10, fig.asp=.45}
+colors <- c("#6BAED6", "#9E9AC8", "#756BB1")
+
+
+XGB.results %>% 
+  filter(model %in% core.models) %>% 
+  group_by(tumor, model) %>% 
+  summarise(auc = area_under_curve(peptides, detected_ligands)) %>% 
+  ggplot( aes(x = tumor, y = auc, fill = model)) +
+  geom_bar(stat = "identity", width=0.75, position=position_dodge(width=0.85), color = "black")+  
+  scale_fill_manual(values = colors, labels = c("Aff", "Aff+Lib", "Aff+Lib(trim)", "Aff+RNA"))+
+  ggtitle("AUC in top 0.1%")+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5), panel.grid.major.y = element_line())
+
+ggsave(("Figs/XGB_AUC_core.pdf"), width = 3, height = 2, scale = 2)
+```
+
+
+```{r plot_auc_core2, fig.width=10, fig.asp=.45}
+colors <- c("#6BAED6",  "#756BB1", "#74C476", "#31A354" ,"#006D2C")
+
+XGB.results %>% 
+  filter(model %in% rna.models) %>% 
+  group_by(tumor, model) %>% 
+  summarise(auc = area_under_curve(peptides, detected_ligands)) %>% 
+  ggplot( aes(x = tumor, y = auc, fill = model)) +
+  geom_bar(stat = "identity", width=0.75, position=position_dodge(width=0.85), color = "black")+  
+  scale_fill_manual(values = colors)+
+  ggtitle("AUC in top 0.1%")+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5), panel.grid.major.y = element_line())
+
+ggsave(("Figs/XGB_AUC_rna.pdf"), width = 3, height = 2, scale = 2)
+```
+
+
+
+```{r plot_auc_core3, fig.width=10, fig.asp=.45}
+colors <- c("#6BAED6",  "#756BB1", "#2171B5", "#08519C" ,"#08306B")
+
+XGB.results %>% 
+  filter(model %in% sf.models) %>% 
+  group_by(tumor, model) %>% 
+  summarise(auc = area_under_curve(peptides, detected_ligands)) %>% 
+  ggplot( aes(x = tumor, y = auc, fill = model)) +
+  geom_bar(stat = "identity", width=0.75, position=position_dodge(width=0.85), color = "black")+  
+  scale_fill_manual(values = colors)+
+  ggtitle("AUC in top 0.1%")+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5), panel.grid.major.y = element_line())
+
+ggsave(("Figs/XGB_AUC_sf.pdf"), width = 3, height = 2, scale = 2)
+```
+
+```{r plot_auc_core4, fig.width=10, fig.asp=.45}
+sf.models <- c("aff_only",  "aff_rna", "aff_lib_small_rna", "aff_ribo","aff_lib_small_ribo", "aff_rna_ribo","aff_lib_small_rna_ribo")
+
+colors <- c("#6BAED6",  "#74C476", "#2171B5","#31A354", "#08519C", "#006D2C","#08306B")
+
+XGB.results %>% 
+  filter(model %in% sf.models) %>% 
+    mutate(model = factor(model, levels = sf.models)) %>% 
+  group_by(tumor, model) %>% 
+  summarise(auc = area_under_curve(peptides, detected_ligands)*1000) %>% 
+  ggplot( aes(x = tumor, y = auc, fill = model)) +
+  geom_bar(stat = "identity", width=0.75, position=position_dodge(width=0.85), color = "black")+  
+  scale_fill_manual(values = colors)+
+  ggtitle("AUC in top 0.1%")+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5), panel.grid.major.y = element_line())
+
+ggsave(("Figs/XGB_AUC_sf_compared.pdf"), width = 3, height = 2, scale = 2)
+```
+
+
+
+## Sensitivity ect 
+
+Read in the data to get metrics of model performance
+
+```{r}
+library(pROC)
+
+XGB.results <- read_tsv("./Output/all_predictions_new.tsv")
+
+XGB.results <- mutate(XGB.results, rank = -rank)
+```
+
+
+Define a function to retrieve the performance metrics, and a function to get the cutoffs at a certain threshold of sensitivity
+
+```{r}
+get_sens_spec <- function(lig, preds, mods){
+ 
+  map(preds, ~roc(lig, .)) %>% 
+     map(~coords(., x = "all", input = "sensitivity", ret = "all") ) -> tmp
+
+    
+  tibble(model = mods, dat = tmp) %>% 
+    unnest()
+    
+}
+
+get_cutoffs <- function(lig, preds, mods, thresh){
+  map(preds, ~roc(lig, .)) %>%
+    map(~coords(., x = thresh, input = "sensitivity", ret = "all") ) %>% 
+  map(~select(., !c(threshold))) %>% 
+  bind_rows() %>% 
+    mutate(model = mods)
+}
+```
+
+Get the information
+
+```{r}
+model.results.info <- get_sens_spec(lig = XGB.results$ligand,
+                                    preds = map2(list(XGB.results), model.order, ~pull(.x, .y)),
+                                    mods =  model.order)
+
+
+coordinates <- get_cutoffs(lig = XGB.results$ligand,
+                           preds = map2(list(XGB.results), model.order, ~pull(.x, .y)),
+                           mods =  model.order,
+                           thresh = 0.1)
+
+model.results.info
+```
+
+And plot at 0.1 sensitivity
+
+```{r}
+colors <- c("#6BAED6",  "#756BB1", "#74C476", "#31A354" ,"#006D2C")
+
+model.results.info %>% 
+  filter(model %in% rna.models) %>% 
+  mutate(model = factor(model, levels = rna.models)) %>% 
+ggplot( aes(x = `1-specificity`, y = sensitivity, color = model))+
+  geom_line( linewidth = 1.5)+
+  coord_cartesian(ylim = c(0.0, 0.1), xlim = c(0.0, 0.001))+
+  geom_segment(aes(x = 0.0, xend = max(coordinates$`1-specificity`), y = .1, yend = .1), color = "black", linetype = "dashed")+
+  geom_segment(data = filter(coordinates, model %in% rna.models), aes(x = `1-specificity`, xend = `1-specificity`, y = 0.0, yend = .1, color = model), 
+               linewidth = 0.8, linetype = "dashed")+
+  scale_color_manual(values = colors)+
+  theme_classic()+
+  theme(panel.grid.major = element_line())
+
+ggsave(("Figs/XGB_SensSpec_10.pdf"), width = 2.8, height = 2, scale = 2)
+
+```
+
+
+And plot at 0.5 sensitivity
+
+
+```{r}
+coordinates <- get_cutoffs(lig = XGB.results$ligand,
+                           preds = map2(list(XGB.results), model.order, ~pull(.x, .y)),
+                           mods =  model.order,
+                           thresh = 0.5)
+
+colors <- c("#6BAED6",  "#756BB1", "#74C476", "#31A354" ,"#006D2C")
+
+model.results.info %>% 
+  filter(model %in% rna.models) %>% 
+  mutate(model = factor(model, levels = rna.models)) %>% 
+ggplot( aes(x = `1-specificity`, y = sensitivity, color = model))+
+  geom_line( linewidth = 1.5)+
+  coord_cartesian(ylim = c(0.0, 0.5), xlim = c(0.0, 0.015))+
+  geom_segment(aes(x = 0.0, xend = max(coordinates$`1-specificity`), y = .5, yend = .5), color = "black", linetype = "dashed")+
+  geom_segment(data = filter(coordinates, model %in% rna.models), aes(x = `1-specificity`, xend = `1-specificity`, y = 0.0, yend = .5, color = model), 
+               linewidth = 0.8, linetype = "dashed")+
+  scale_color_manual(values = colors)+
+  theme_classic()+
+  theme(panel.grid.major = element_line())
+
+ggsave(("Figs/XGB_SensSpec_50.pdf"), width = 2.8, height = 2, scale = 2)
+```
+
