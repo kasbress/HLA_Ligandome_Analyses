@@ -1,0 +1,382 @@
+---
+title: "PTM analysis external"
+author: "Kaspar Bresser"
+date: "15/01/2024"
+output: 
+  github_document:
+   toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+#                      comment = NA,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+
+```
+
+Below a few analysis that we performed to verify if the peptides detected by Mass Spec were indeed HLA ligands
+
+Lets load in the packages required for the analysis.
+
+```{r loading}
+library(tidyverse)
+library(rstatix)
+library(readxl)
+library(RColorBrewer)
+```
+
+
+
+## Check sheets
+
+
+```{r}
+readxl::excel_sheets("41467_2023_37547_MOESM10_ESM(1).xlsx")
+```
+
+
+```{r}
+readxl::excel_sheets("41467_2023_37547_MOESM12_ESM.xlsx")
+```
+
+
+## Read ligands
+
+read in the HLA class I ligands.
+
+```{r}
+HLA.ligands <- read_excel("41467_2023_37547_MOESM12_ESM.xlsx", sheet = "Fig3,5_Canonical_HLA-I_LUAD")
+
+HLA.ligands
+```
+
+Keep only what we need
+
+
+```{r}
+HLA.ligands %>% 
+  filter(plotType == "NA") %>% 
+  select(directory, sequence, geneSymbol, allele) -> HLA.ligands
+
+HLA.ligands
+```
+
+
+## Compare with PTMs
+
+
+### Get swissprot and protein abundance
+
+```{r}
+read_tsv("uniprotkb_Human_AND_reviewed_true_2023_12_14.tsv.gz") %>% 
+  transmute(geneSymbol = `Gene Names (primary)`, Entry = `Entry Name`, Length = Length) %>% 
+  filter(str_detect(Entry, "HUMAN")) -> sp.human
+
+sp.human
+```
+
+
+```{r}
+prot <- read_excel("41467_2023_37547_MOESM10_ESM(1).xlsx", sheet = "Fig4,6_Proteome", skip = 2)
+
+prot %>% 
+  filter(geneSymbol != "na") %>% 
+  select(geneSymbol, contains("C3")) %>%
+  pivot_longer(col = contains("C3"), names_to = "patient", values_to = "abundance") %>% 
+  mutate(abundance = as.numeric(abundance)) %>% 
+  na.omit() %>% 
+  group_by(geneSymbol) %>% 
+  summarise(abundance = mean(abundance)) -> prot
+
+prot
+```
+
+```{r}
+sp.human %>% 
+  right_join(prot) -> sp.human.abundance
+
+sp.human.abundance
+```
+
+
+
+### Phospho
+
+get the data, clean up. 
+
+```{r}
+PTM.dat <- read_excel("41467_2023_37547_MOESM10_ESM(1).xlsx", sheet = "Fig4,6_Phosphoproteome", skip = 2)
+
+PTM.dat %>% 
+  filter(geneSymbol != "na") %>% 
+  select(geneSymbol, variableSites, contains("C3"))-> PTM.dat
+
+PTM.dat
+```
+
+Count PTM sites per protein and combine with ligand data, 
+
+
+```{r}
+PTM.dat %>% 
+  count(geneSymbol, name = "PTM.sites") -> PTM.dat
+
+sp.human %>% 
+  filter(!is.na(geneSymbol) ) %>% 
+  select(geneSymbol) %>% 
+  left_join(PTM.dat, by = c("geneSymbol")) %>% 
+  full_join(HLA.ligands, by = c("geneSymbol")) %>% 
+  count(geneSymbol, PTM.sites, directory, name = "n.ligands") %>% 
+  replace_na(list(n.ligands = 0, PTM.sites = 0)) %>% 
+  na.omit() -> to.plot
+```
+
+Plot the mean amount of ligands found across all proteins with X PTM sites, per patient sample.
+
+```{r}
+
+p1 <- to.plot %>% 
+    inner_join(sp.human, by = "geneSymbol") %>% 
+  mutate(PTM.sites = case_when( PTM.sites > 10 ~ 10,
+                                     TRUE ~ PTM.sites)) %>% 
+  mutate(PTM.sites = factor(PTM.sites, levels = 0:10)) %>% 
+  group_by(directory, PTM.sites) %>% 
+  summarise(mean.ligands = mean(n.ligands)) %>% 
+ggplot(aes(x = PTM.sites, y = mean.ligands, group = directory))+
+  geom_line()+
+  geom_point(aes(fill = (PTM.sites)), shape = 21, size = 2.5)+
+  scale_fill_manual(values = colorRampPalette(brewer.pal(9, name = "Reds"))(15)[3:13])+
+  scale_y_continuous(breaks = c(2,3,4,5,6))+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line(), legend.position = "none")+
+  ggtitle("mean amount of ligands per X Phosphorylation sites")
+
+p1
+
+ggsave("Figs/Phos_lines_per_site.pdf", width = 5, height = 3)
+```
+
+Plot the mean amount of ligands found across all proteins with X PTM sites, per patient sample. Length corrected.
+
+```{r}
+p4 <- to.plot %>% 
+     inner_join(sp.human, by = "geneSymbol") %>% 
+  mutate(PTM.sites = case_when( PTM.sites > 10 ~ 10,
+                                     TRUE ~ PTM.sites)) %>% 
+  mutate(PTM.sites = factor(PTM.sites, levels = 0:10)) %>% 
+  group_by(directory, PTM.sites) %>% 
+  summarise(mean.ligands = mean(n.ligands), mean.length = mean(Length), mean.ligand.length.cor = (mean.ligands/mean.length)*1000) %>% 
+ggplot(aes(x = PTM.sites, y = mean.ligand.length.cor, group = directory))+
+  geom_line()+
+  geom_point(aes(fill = (PTM.sites)), shape = 21, size = 2.5)+
+  scale_fill_manual(values = colorRampPalette(brewer.pal(9, name = "Reds"))(15)[3:13])+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line(), legend.position = "none")+
+  ggtitle("mean amount of ligands per X Phosphorylation sites")
+
+p4
+
+ggsave("Figs/Phos_lines_per_site_corrected.pdf", width = 5, height = 3)
+```
+
+
+
+
+### Ubiquitin
+
+get the data, clean up. 
+
+```{r}
+PTM.dat <- read_excel("41467_2023_37547_MOESM10_ESM(1).xlsx", sheet = "Fig4,6_Ubiquitylome", skip = 2)
+
+PTM.dat %>% 
+  filter(geneSymbol != "na") %>% 
+  select(geneSymbol, variableSites, contains("C3")) -> PTM.dat
+
+PTM.dat
+```
+
+Count PTM sites per protein and combine with ligand data, 
+
+
+```{r}
+PTM.dat %>% 
+  count(geneSymbol, name = "PTM.sites") -> PTM.dat
+
+sp.human %>% 
+  filter(!is.na(geneSymbol) ) %>% 
+  select(geneSymbol) %>% 
+  left_join(PTM.dat, by = c("geneSymbol")) %>% 
+  full_join(HLA.ligands, by = c("geneSymbol")) %>% 
+  count(geneSymbol, PTM.sites, directory, name = "n.ligands") %>% 
+  replace_na(list(n.ligands = 0, PTM.sites = 0)) %>% 
+  na.omit() -> to.plot
+```
+
+
+Plot the mean amount of ligands found across all proteins with X PTM sites, per patient sample. Length corrected.
+
+```{r}
+library(RColorBrewer)
+
+p5 <- to.plot %>% 
+     inner_join(sp.human, by = "geneSymbol") %>% 
+  mutate(PTM.sites = case_when( PTM.sites > 10 ~ 10,
+                                     TRUE ~ PTM.sites)) %>% 
+  mutate(PTM.sites = factor(PTM.sites, levels = 0:10)) %>% 
+  group_by(directory, PTM.sites) %>% 
+  summarise(mean.ligands = mean(n.ligands), mean.length = mean(Length), mean.ligand.length.cor = (mean.ligands/mean.length)*1000) %>% 
+ggplot(aes(x = PTM.sites, y = mean.ligand.length.cor, group = directory))+
+  geom_line()+
+  geom_point(aes(fill = PTM.sites), shape = 21, size = 2.5)+
+  scale_fill_manual(values = colorRampPalette(brewer.pal(9, name = "Blues"))(15)[3:13])+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line(), legend.position = "none")+
+  ggtitle("mean amount of ligands per X Ubiquitin sites")
+
+p5
+
+ggsave("Figs/Phos_lines_per_site_corrected.pdf", width = 5, height = 3)
+```
+
+
+
+
+Plot the mean amount of ligands found across all proteins with X PTM sites, per patient sample. 
+
+```{r}
+p2 <- to.plot %>% 
+  mutate(PTM.sites = case_when( PTM.sites > 10 ~ 10,
+                                     TRUE ~ PTM.sites)) %>% 
+  mutate(PTM.sites = factor(PTM.sites, levels = 0:10)) %>% 
+  group_by(directory, PTM.sites) %>% 
+  summarise(mean.ligands = mean(n.ligands)) %>% 
+ggplot(aes(x = PTM.sites, y = mean.ligands, group = directory))+
+  geom_line()+
+  geom_point(aes(fill = PTM.sites), shape = 21, size = 2.5)+
+  scale_fill_manual(values = colorRampPalette(brewer.pal(9, name = "Blues"))(15)[3:13])+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line(), legend.position = "none")+
+  ggtitle("mean amount of ligands per X Ubiquitin sites")
+
+p2
+
+ggsave("Figs/Ubi_lines_per_site.pdf", width = 5, height = 3)
+```
+
+
+
+### Acetylation
+
+get the data, clean up. 
+
+```{r}
+PTM.dat <- read_excel("41467_2023_37547_MOESM10_ESM(1).xlsx", sheet = "Fig4,6_Acetylome", skip = 2)
+
+PTM.dat %>% 
+  filter(geneSymbol != "na") %>% 
+  select(geneSymbol, variableSites, contains("C3"))-> PTM.dat
+
+PTM.dat
+```
+
+Count PTM sites per protein and combine with ligand data, 
+
+
+```{r}
+PTM.dat %>% 
+  count(geneSymbol, name = "PTM.sites") -> PTM.dat
+
+sp.human %>% 
+  filter(!is.na(geneSymbol) ) %>% 
+  select(geneSymbol) %>% 
+  left_join(PTM.dat, by = c("geneSymbol")) %>% 
+  full_join(HLA.ligands, by = c("geneSymbol")) %>% 
+  count(geneSymbol, PTM.sites, directory, name = "n.ligands") %>% 
+  replace_na(list(n.ligands = 0, PTM.sites = 0)) %>% 
+  na.omit() -> to.plot
+```
+
+Plot the mean amount of ligands found across all proteins with X PTM sites, per patient sample.
+
+```{r}
+p3 <- to.plot %>% 
+  mutate(PTM.sites = case_when( PTM.sites > 10 ~ 10,
+                                     TRUE ~ PTM.sites)) %>% 
+  mutate(PTM.sites = factor(PTM.sites, levels = 0:10)) %>% 
+  group_by(directory, PTM.sites) %>% 
+  summarise(mean.ligands = mean(n.ligands)) %>% 
+ggplot(aes(x = PTM.sites, y = mean.ligands, group = directory))+
+  geom_line()+
+  geom_point(aes(fill = PTM.sites), shape = 21, size = 2.5)+
+  scale_fill_manual(values = colorRampPalette(brewer.pal(9, name = "Blues"))(15)[3:13])+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line(), legend.position = "none")+
+  ggtitle("mean amount of ligands per X Acetylation sites")
+
+p3
+
+ggsave("Figs/Ace_lines_per_site.pdf", width = 5, height = 3)
+```
+
+Plot the mean amount of ligands found across all proteins with X PTM sites, per patient sample. Length corrected.
+
+```{r}
+p6 <- to.plot %>% 
+     inner_join(sp.human, by = "geneSymbol") %>% 
+  mutate(PTM.sites = case_when( PTM.sites > 10 ~ 10,
+                                     TRUE ~ PTM.sites)) %>% 
+  mutate(PTM.sites = factor(PTM.sites, levels = 0:10)) %>% 
+  group_by(directory, PTM.sites) %>% 
+  summarise(mean.ligands = mean(n.ligands), mean.length = mean(Length), mean.ligand.length.cor = (mean.ligands/mean.length)*1000) %>% 
+ggplot(aes(x = PTM.sites, y = mean.ligand.length.cor, group = directory))+
+  geom_line()+
+  geom_point(aes(fill = PTM.sites), shape = 21, size = 2.5)+
+  scale_fill_manual(values = colorRampPalette(brewer.pal(9, name = "Greens"))(15)[3:13])+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line(), legend.position = "none")+
+  ggtitle("mean amount of ligands per X Acetylation sites")
+
+p6
+
+ggsave("Figs/Ace_lines_per_site_corrected.pdf", width = 5, height = 3)
+```
+
+ 
+
+
+### Combine figures
+
+
+```{r fig.width=12, fig.asp=.3}
+library(patchwork)
+wrap_plots(list(p3,p2,p1), nrow = 1) & scale_y_continuous(limits = c(1, 6), breaks = 1:6)
+
+ggsave("./Figs/combined_PTM_plots_length_corrected.pdf", units = "mm", width = 160, height = 45, scale = 1.8)
+```
+
+
+```{r fig.width=12, fig.asp=.3}
+
+wrap_plots(list(p6,p5,p4), nrow = 1) & scale_y_continuous(limits = c(1, 6), breaks = 1:6)
+
+ggsave("./Figs/combined_PTM_plots.pdf", units = "mm", width = 160, height = 45, scale = 1.8)
+```
+
+
+
+
+
