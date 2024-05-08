@@ -1,0 +1,360 @@
+---
+title: "Generate peptide database"
+author: "Kaspar Bresser"
+date: "25/03/2024"
+
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+#    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      eval=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+#                     comment = NA,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+
+prepping the mono-allelic dataset for further processing. Extracting dta from several alleles, adding decoys, and performing netMHCpan predictions. 
+
+
+```{r startup, eval=TRUE}
+library(babelgene)
+library(seqinr)
+library(tidyverse)
+library(GGally)
+library(readxl)
+library(furrr)
+```
+
+
+## Get RNA expression
+
+We'll first want to check which genes are expressed by the cell line that was used in the manuscript. Analyzed 4 RNAseq samples that were deposited by the authors. Start with reading in the tables. 
+
+```{r read_rna, eval=TRUE}
+folders <- list.files(("Data/RNAseq"), pattern = "^quasi_")
+
+salmon.results <- tibble(salmon = map(paste0("Data/RNAseq/", folders, "/quant.sf"), read_tsv),
+                         sample = folders)
+
+salmon.results
+```
+
+
+Check correlation between the samples using `GGally::ggpairs`.
+
+```{r plot_RNAseq, fig.width=8, eval=TRUE}
+salmon.results %>% 
+  unnest(salmon) %>% 
+  mutate(TPM = log10(TPM+1)) %>% 
+  pivot_wider(id_cols = Name, names_from = sample, values_from = TPM) %>% 
+  ggpairs(columns = 2:5)
+```
+
+
+Consistency between samples looks good. Calculate mean values. 
+
+```{r average_tmp, eval=TRUE}
+salmon.results %>% 
+  unnest(salmon) %>%
+  group_by(Name) %>% 
+  summarise(TPM = mean(TPM)) %>% 
+  transmute(ensembl_id = str_remove_all(Name, "\\.\\d+"), TPM = TPM) -> rna.expression
+
+rna.expression
+```
+
+Check the amount of expressed genes
+
+```{r check_expressed, eval=TRUE}
+table(rna.expression$TPM > 0)
+```
+
+Read conversion table, which contains Ensemble transcript and gene IDs, and swissprot IDs.
+
+```{r read_conversion, eval=TRUE}
+conversion.table <- na.omit(read_tsv("Data/HLA_peptidomics/conversion.txt"))
+
+conversion.table
+```
+
+Extract the transcript ID from the ensembl_id column, join with the conversion table, 
+
+```{r join_rna_conversion, eval=TRUE}
+rna.expression %>% 
+  transmute(`Ensembl Transcript ID` = str_extract(ensembl_id, "ENST\\d+"), TPM = TPM) %>% 
+  left_join(conversion.table) %>% 
+  mutate(ensembl_id = `Ensembl Gene ID`, swissprot_id = `UniProt/SwissProt Accession`) %>% 
+  group_by(ensembl_id) %>% 
+  summarise(TPM = sum(TPM), swissprot_id = unique(swissprot_id)) -> rna.expression
+
+```
+
+
+```{r join_rna_conversion2}
+write_tsv(rna.expression, "Broad_Data/RNAseq/averaged_TPM_values_salmon.tsv")
+```
+
+
+
+## Import ligands
+
+
+```{r check_sheets, eval=TRUE}
+excel_sheets("Data/HLA_peptidomics/41587_2019_322_MOESM3_ESM.xlsx")
+```
+
+
+
+```{r import_ligand_data, eval=TRUE}
+alleles <- c("A2402", "A0201",  "A1101", "A3101", "A2301", "A7401",
+             "B3501", "B5101", "B4001", "B0702", "B5802", "B4402", 
+             "C0702", "C1203", "C1402", "C1701","C1601", "C0202",
+             "G0103", "G0101")
+excel.file <- "Data/HLA_peptidomics/41587_2019_322_MOESM3_ESM.xlsx"
+
+tibble(data = map(alleles, ~read_excel(excel.file, sheet = . )), allele = alleles) %>% 
+  mutate(data = map(data, ~select(., sequence, hg19.kgXref.geneSymbol))) -> broad.HLA.data
+  
+broad.HLA.data
+```
+
+Tidy up, and add peptide lengths.
+
+```{r tidy_broad_data, eval=TRUE}
+broad.HLA.data %>% 
+  unnest(data) %>% 
+  mutate(pep_length = str_length(sequence)) %>% 
+  dplyr::rename(gene.symbol = "hg19.kgXref.geneSymbol") -> broad.HLA.data
+
+broad.HLA.data
+```
+
+Check the amount of 9,10,11mers for each allele. 
+
+```{r check_9mers, eval=TRUE}
+pep.lengths <- count(broad.HLA.data, allele, pep_length)
+
+pep.lengths %>% 
+  filter(pep_length %in% 8:12) %>% 
+ggplot( aes(x = pep_length, y = n, color = allele))+
+  geom_line()
+```
+
+Broad data uses gene symbols, expand the conversion table to include those. 
+
+```{r expand_conversion, eval=TRUE}
+babelgene::orthologs(genes = na.omit(broad.HLA.data)$gene.symbol, species = "mouse", top = T) %>% 
+  transmute(gene.symbol = human_symbol, ensemble_id =  human_ensembl) %>% 
+  full_join(conversion.table, by = c("ensemble_id" = "Ensembl Gene ID")) %>% 
+  as_tibble() -> conversion.table
+
+conversion.table
+```
+
+Select the peptides
+
+```{r select_alleles, eval=TRUE}
+broad.HLA.data %>% 
+  filter(pep_length %in% 9:11) %>% 
+  mutate(sequence = str_to_upper(sequence)) %>% 
+  inner_join(conversion.table, na_matches = "never") %>% 
+  group_by(allele) %>% 
+  distinct(sequence, .keep_all = T) %>% 
+  transmute(sequence = sequence, swissprot_id = `UniProt/SwissProt Accession`, allele = allele, ensembl_id = ensemble_id) -> filtered.peptides
+
+filtered.peptides
+```
+
+```{r}
+write_tsv(filtered.peptides, "Output/Broad_peptides.tsv")
+```
+
+
+
+Subsample the peptide pools to get a more workable number, 500 is slightly under the smallest allele-set. 
+
+```{r subsample, eval=TRUE}
+"../2-random_forest_analyses/Data/Protein_per_Uniprot_entry_library_v3.csv.zip" %>% 
+  read_tsv() %>% 
+  pull(Entry) -> IDs.in.library
+
+filtered.peptides %>% 
+  filter(swissprot_id %in% IDs.in.library) %>% 
+  group_by(allele) %>% 
+  slice_sample(n = 500) %>% 
+  mutate(ligand = TRUE) %>% 
+  ungroup() -> filtered.peptides
+
+filtered.peptides
+```
+
+```{r}
+write_tsv(filtered.peptides, "Output/Broad_peptides_subsample.tsv")
+```
+
+
+## Select decoys
+
+Import UniProt sequences, use the rna expression table to make an ensembl/UniProt matching table.
+
+Define a function that, for each allele: (1) Checks which sequences were detected for that allele, (2) samples an excess of proteins from the uniprot table weighted by their length, (3) then for each sample extracts a 9mer, (4) Remove detected peptides, filter for uniqueness and down sample to 350,000. 
+
+
+```{r}
+uniprot <- read_csv("Data/UniProt_reviewed_input.tsv") %>% rename(swissprot_id = "sequence_id")
+
+
+rna.expression %>% 
+  filter(swissprot_id %in% IDs.in.library) %>% 
+  right_join(uniprot) %>% 
+  replace_na(list(TPM = 0.0)) -> rna.expression
+
+rna.expression %>% 
+  rename(rna = TPM) %>% 
+  select(rna, swissprot_id) %>% 
+  right_join(filtered.peptides) %>% 
+  replace_na(list(rna = 0.0)) %>% 
+  distinct(sequence, allele, .keep_all = T) %>% 
+  na.omit() -> filtered.peptides
+
+```
+
+
+```{r import_uniprot}
+fitered.peptides %>% count(allele, nchar(sequence)) %>% group_by(`nchar(sequence)`) %>% summarise(max(n))
+
+uniprot <- read_csv("Data/HLA_peptidomics/UniProt_reviewed_input.tsv")
+
+
+get_peptide <- function(a, pep.len){
+  broad.HLA.data %>% 
+    mutate(sequence = str_to_upper(sequence)) %>% 
+    filter(allele == a) %>% 
+    filter(nchar(sequence) == pep.len) %>% 
+    pull(sequence) %>% 
+    toupper() -> s
+  
+    amount.needed <- nrow(filter(filtered.peptides, allele == a & nchar(sequence) == pep.len))*1000
+  
+  rna.expression %>% 
+    mutate(len = nchar(sequence)) %>% 
+    slice_sample(n = amount.needed*2, weight_by = len, replace = T) %>% 
+    rowwise() %>% 
+    mutate(number = sample(1:(nchar(sequence)-pep.len), 1),
+         sequence = str_sub(sequence, number, number+(pep.len-1))) %>% 
+    ungroup() %>% 
+    filter(!(sequence %in% s)) %>% 
+    transmute(sequence = sequence, swissprot_id = swissprot_id, allele = a, rna = TPM, ligand = FALSE) %>% 
+    filter(swissprot_id %in% IDs.in.library) %>% 
+    distinct(sequence, .keep_all = T) %>% 
+    slice_sample(n = amount.needed)
+}
+
+decoys <- map2_dfr(rep(alleles, 3), rep(c(9,10,11), each = 20), get_peptide)
+
+filtered.peptides %>% 
+  select(!ensembl_id) %>% 
+  bind_rows(decoys) -> test.set
+
+
+test.set %>% 
+  count(allele, ligand, nchar(sequence))
+
+```
+
+Write out the table and peptide files
+
+```{r, echo=FALSE}
+test.set %>% 
+  transmute(pep.len = paste0(nchar(sequence), "AA"), sequence = sequence, allele = allele) %>% 
+  unite("info", allele, pep.len) %>% 
+  nest(data = sequence) %>% 
+  mutate(peptides = map(data, pull, sequence),
+         peptides = set_names(peptides, info)) %>% 
+  pull(peptides) %>% 
+  map2(names(.), ~write_lines(.x, paste0("./Output/peptides/Broad_Test_Peptides_", .y, ".tsv")))
+
+write_tsv(test.set, "./Output/Broad_Test_Table.tsv")
+```
+
+## Run netMHCpan
+
+Run system command for netMHCpan, for each allele. 
+
+```{r echo=FALSE}
+args_netMHC <- function(fil){
+ 
+   allele <- str_split_1(fil, "_")[4]
+   pep.len <- str_extract(str_split_1(fil, "_")[5], "\\d+")
+  
+  c(
+    paste0("-a HLA-", sub("(.{3})(.*)", "\\1:\\2", allele)),
+    paste0("-f ", fil),
+    "-p",
+    "-rth 0.0",
+    "-rlt 0.0",
+    paste0("-l ", pep.len),
+    "-t -100"
+  )
+}
+
+
+files <- paste0("Output/peptides/", list.files("Output/peptides/"))
+
+plan(multisession, workers = 6)
+
+future_map(files, ~system2(command = "netMHCpan", 
+                      args = args_netMHC(.), 
+                      stdout  = paste0("./Output/netMHCpan_predictions/", str_split_1(., "/")[3])))
+
+
+```
+
+
+Define function to read in predictions for each peptide length, cleanup the netMHC output, and combine them in a single tsv file
+
+```{r}
+combine_and_clean <- function(allele){
+
+  file.list <- list.files("./Output/netMHCpan_predictions/", pattern = allele)
+  file.list <- paste0("./Output/netMHCpan_predictions/", file.list)
+  
+  file.list %>% 
+    map(read_lines) %>% 
+    map(~.[grepl("   1 HLA", .)]) %>% 
+    unlist() %>% 
+    c(" Pos         MHC        Peptide      Core Of Gp Gl Ip Il        Icore        Identity  Score_EL %Rank_EL", .) %>% 
+    write_lines(paste0("./Output/netMHCpan_predictions_clean/", allele,".tsv"))
+  
+  gc()
+}
+```
+
+
+Apply the function for each allele
+
+```{r}
+
+map(alleles, combine_and_clean)
+```
+
+
+

@@ -1,0 +1,166 @@
+---
+title: "XGB results top 0.1% Broad data"
+author: "Kaspar Bresser"
+date: "26/03/2024"
+
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+#    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+#                     comment = NA,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+Used the analysis below to compare the performance of the XGB models.
+
+```{r loading}
+library(bayestestR)
+library(tidyverse)
+library(rstatix)
+library(ggpubr)
+library(pROC)
+```
+
+## Import and tidy data
+
+Import the results table.
+
+```{r import_results}
+XGB.results <- read_tsv("./Output/all_predictions_mono_allelic.tsv")
+```
+
+Convert the ligand column to a binary so it can be used for cumsum calculation, pivot to longer data by putting the models in a grouped format.
+
+```{r prep_data}
+XGB.results %>% 
+  mutate(detected = case_when(ligand == TRUE ~ 1,
+                              TRUE ~ 0)) %>% 
+  pivot_longer(cols = !c("detected", "ligand", "allele", "sequence", "swissprot_id"), 
+               names_to =  "model", 
+               values_to =  "score") -> XGB.results
+
+XGB.results
+
+```
+
+
+For these analysis we'll focus on the top 0.1% scoring peptides for each model. Let's subset on those. Note that I arrange on both both model scores and a random number for tie breaking.
+
+Next we'll calculate the cumulative sums by grouping by allele and model. 
+
+Note that `cumsum()` takes an ordered dataframe. 
+
+```{r data_prep3}
+XGB.results %>% 
+  group_by(allele, model) %>% 
+  mutate(random = sample(1:n())) %>% 
+  arrange(desc(score), random, .by_group = T) %>% 
+    mutate(peptides = 1:n()/n(), 
+         detected_ligands = cumsum(detected)/sum(detected)) %>% 
+  slice_head(prop = .001) -> XGB.results
+ 
+XGB.results
+```
+
+
+
+
+
+Lastly, set the ordering in which we'd like the models to appear in plots, by converting the models variable to a factor
+
+```{r data_prep4}
+unique(XGB.results$model)
+
+model.order <- c("aff_only", "aff_lib","aff_lib_small", "aff_lib_large", "aff_rna", "rank", "rna")
+
+allele.order <- unique(XGB.results$allele)
+
+colors <- c("#27aae1", "#6675b8", "#834e9f", "#2bb673", "#2e7a3c", "grey")
+
+XGB.results %>% 
+  filter(model %in% model.order) %>% 
+  mutate(model = as_factor(model),
+         model = fct_relevel(model, model.order),
+         allele = as_factor(allele),
+         allele = fct_relevel(allele, allele.order)) -> XGB.results
+
+XGB.results
+```
+
+
+## Area under the curve
+
+Or calculate the AUC of these curves as a summary metric and plot that. Used the `area_under_curve()` function from the [bayestestR](https://easystats.github.io/bayestestR/index.html) package. 
+
+```{r plot_auc, fig.width=10, fig.asp=.45}
+mods <-  c("aff_only", "aff_lib_small", "aff_lib_large", "aff_rna")
+
+
+XGB.results %>% 
+  filter(model %in% mods) %>% 
+  group_by(allele, model) %>% 
+  summarise(auc = area_under_curve(peptides, detected_ligands)) %>% 
+  ggplot( aes(x = allele, y = auc, fill = model)) +
+  geom_bar(stat = "identity", width=0.75, position=position_dodge(width=0.85), color = "black")+
+    scale_fill_manual(values = colors, labels = c("Aff", "Aff+Lib", "Aff+Lib(2.0)", "Aff+RNA"))+
+  ggtitle("AUC in top 0.1%")+
+  theme_classic()+
+    theme(plot.title = element_text(hjust = 0.5), 
+          panel.grid.major.y = element_line(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+ggsave(("Figs/XGB_Ext_AUC_bar_core.pdf"), width = 4, height = 2, scale = 2)
+```
+
+
+```{r}
+XGB.results %>% 
+  filter(model %in% mods) %>% 
+  group_by(allele, model) %>% 
+  summarise(auc = area_under_curve(peptides, detected_ligands)) %>% 
+  mutate(model = fct_drop(model)) %>%
+  ungroup() %>% 
+  rstatix::t_test( auc ~ model, paired = T) %>% 
+  add_xy_position(x = "model") %>% 
+  mutate(p.adj = round(p.adj, 4)) -> stats
+```
+
+
+```{r PVV_plot_increment2, fig.width=5, fig.asp=.85}
+XGB.results %>% 
+  filter(model %in% mods) %>% 
+  group_by(allele, model) %>% 
+  summarise(auc = area_under_curve(peptides, detected_ligands)) %>% 
+    ggplot( aes(x = model, y = auc)) +
+    geom_boxplot(aes(fill = model), color = "black", outlier.shape = NA)+
+    geom_jitter(width = 0.1)+
+    scale_fill_manual(values = colors, labels = c("Aff", "Aff+Lib", "Aff+Lib(2.0)", "Aff+RNA"))+
+    stat_pvalue_manual(stats, label = "p.adj", 
+                     tip.length = 0.00, hide.ns = F, label.size = 2 )+
+    ggtitle("AUC in top 0.1%")+
+    theme_classic()+
+    theme(plot.title = element_text(hjust = 0.5), panel.grid.major.y = element_line(), axis.text.x = element_blank())
+
+
+
+ggsave(("Figs/XGB_Ext_AUC_box_core.pdf"), width = 2, height = 2.5, scale = 2)
+```
+

@@ -1,0 +1,84 @@
+---
+title: "Generate test set for XGB models"
+author: "Kaspar Bresser"
+date: "25/03/2024"
+
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+#    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+#                     comment = NA,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+```{r startup}
+library(tidyverse)
+```
+
+
+
+
+## Finish test table
+
+Import the tables and combine into single table.
+
+```{r}
+files <- list.files("./Output/netMHCpan_predictions_clean/")
+
+files %>% 
+  str_split("\\.") %>% 
+  map(1) %>% 
+  as.character() -> alleles
+
+tibble(allele = alleles, 
+       dat = map(files, ~read_table(paste0("./Output/netMHCpan_predictions_clean/", .)))) %>% 
+  unnest(dat) -> test.table
+
+test.table
+```
+
+
+Add to test table
+
+
+```{r}
+test.table %>% 
+  transmute(sequence = Peptide, allele = allele, rank = `%Rank_EL`) %>% 
+  nest(dat = -allele) -> test.table
+
+read_tsv("./Output/Broad_Test_Table.tsv") %>% 
+  nest(dat2 = -allele) %>% 
+  inner_join(test.table) %>% 
+  mutate(dat = map2(dat, dat2, ~inner_join(.x, .y, by = c("sequence")))) %>% 
+  select(-dat2) %>% 
+  unnest(dat) -> test.table
+
+test.table %>% 
+  count(allele, ligand)
+```
+
+
+```{r}
+write_tsv(test.table, "Output/Test_Table_Broad.tsv")
+```
+
+
+
