@@ -1,0 +1,306 @@
+---
+title: "nuORF data prep"
+author: "Kaspar Bresser"
+date: "28/03/2024"
+
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+#    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      eval = FALSE,
+                      cache = FALSE,
+#                     comment = NA,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+```{r startup, eval = T}
+library(babelgene)
+library(tidyverse)
+library(furrr)
+library(readxl)
+```
+
+
+## Import ligands
+
+
+```{r check_sheets, eval = T}
+MS.data <- read_excel("nuORFs.xlsx")
+```
+
+
+```{r, eval = T}
+MS.data %>% 
+  count(plotType)
+```
+
+
+```{r, eval = T}
+internal.ORFs <- c("3' Overlap dORF", "3' dORF", "5' Overlap uORF", "5' uORF", "Out-of-Frame")
+
+MS.data %>% 
+  filter(plotType %in% internal.ORFs) %>% 
+  filter(nchar(sequence) < 15 & nchar(sequence) > 7) %>% 
+  select(sequence, allele, `Mapped protein`, plotType ) %>% 
+  group_by(allele) %>% 
+  filter(n() > 100) %>% 
+  ungroup() -> MS.data.filtered
+  
+```
+
+
+
+Tidy up, and add peptide lengths.
+
+```{r tidy_broad_data, eval = T}
+MS.data.filtered %>% 
+  mutate(pep.length = nchar(sequence))  -> MS.data.filtered
+
+MS.data.filtered
+```
+
+
+```{r, eval = T}
+convert <- read_tsv("conversion.txt") %>% select(`Ensembl Transcript ID`, `UniProt/SwissProt Accession`) %>% na.omit()
+
+MS.data.filtered %>% 
+  mutate(ens.transcript = str_extract(`Mapped protein`, "ENST\\d*")) %>% 
+  inner_join(convert, by = c("ens.transcript" = "Ensembl Transcript ID")) %>% 
+  distinct() -> MS.data.filtered
+
+MS.data.filtered
+```
+
+
+
+
+
+Subsample the peptide pools to get a more workable number, 1000 should suffice
+
+```{r subsample, eval = T}
+"../2-random_forest_analyses/Data/Protein_per_Uniprot_entry_library_v3.csv.zip" %>% 
+  read_tsv() %>% 
+  pull(Entry) -> IDs.in.library
+
+
+
+MS.data.filtered %>% 
+  rename(swissprot.id = `UniProt/SwissProt Accession`) %>% 
+  filter(swissprot.id %in% IDs.in.library) %>% 
+  mutate(ligand = TRUE) %>% 
+  ungroup() %>% 
+  select(sequence, allele, swissprot.id, ligand) -> filtered.peptides
+
+filtered.peptides
+```
+
+## Select decoys
+
+Import UniProt sequences, use the rna expression table to make an ensembl/UniProt matching table.
+
+Define a function that, for each allele: (1) Checks which sequences were detected for that allele, (2) samples an excess of proteins from the uniprot table weighted by their length, (3) then for each sample extracts a 9mer, (4) Remove detected peptides, filter for uniqueness and down sample to 350,000. 
+
+
+```{r import_uniprot}
+canon <- read_excel("nuORFs.xlsx", sheet = "Canonical")
+
+uniprot <- read_csv("UniProt_reviewed_input.tsv") %>% rename(swissprot.id = "sequence_id")
+
+
+get_peptide <- function(al, pep.len){
+  MS.data %>% 
+    bind_rows(canon) %>% 
+    mutate(sequence = str_to_upper(sequence)) %>% 
+    filter(allele == al) %>% 
+    filter(nchar(sequence) == pep.len) %>% 
+    pull(sequence) -> s
+  
+    amount.needed <- nrow(filter(filtered.peptides, allele == al & nchar(sequence) == pep.len))*1000
+    
+    if (amount.needed == 0) {
+      tibble(sequence = NA, swissprot.id = NA, allele = NA, ligand = NA)
+      return()
+    }
+    
+    else{
+      uniprot %>% 
+    filter(swissprot.id %in% IDs.in.library) %>%
+    mutate(len = nchar(sequence)) %>% 
+    slice_sample(n = amount.needed*2, weight_by = len, replace = T) %>% 
+    rowwise() %>% 
+    mutate(number = sample(1:(nchar(sequence)-pep.len), 1),
+         sequence = str_sub(sequence, number, number+(pep.len-1))) %>% 
+    ungroup() %>% 
+    filter(!(sequence %in% s)) %>% 
+    transmute(sequence = sequence, swissprot.id = swissprot.id, allele = al, ligand = FALSE) %>% 
+    distinct(sequence, .keep_all = T) %>% 
+    slice_sample(n = amount.needed)
+    }
+  
+
+}
+
+alleles <- unique(filtered.peptides$allele)
+
+decoys <- map2_dfr(rep(alleles, 7), rep(8:14, each = 19), get_peptide)
+
+
+filtered.peptides %>% 
+  bind_rows(decoys) -> test.set
+
+
+test.set %>% 
+  count(allele, ligand, nchar(sequence))
+
+```
+
+Write out the table and peptide files
+
+```{r, echo=FALSE}
+test.set %>% 
+  transmute(pep.len = paste0(nchar(sequence), "AA"), sequence = sequence, allele = allele) %>% 
+  unite("info", allele, pep.len) %>% 
+  nest(data = sequence) %>% 
+  mutate(peptides = map(data, pull, sequence),
+         peptides = set_names(peptides, info)) %>% 
+  pull(peptides) %>% 
+  map2(names(.), ~write_lines(.x, paste0("./Output/peptides/nuORF_Test_Peptides_", .y, ".tsv")))
+
+write_tsv(test.set, "./Output/nuORF_Test_Table.tsv")
+```
+
+
+
+
+
+
+## Run netMHCpan
+
+Run system command for netMHCpan, for each allele. 
+
+```{r echo=FALSE}
+args_netMHC <- function(fil){
+ 
+   allele <- str_split_1(fil, "_")[4]
+   pep.len <- str_extract(str_split_1(fil, "_")[5], "\\d+")
+  
+  c(
+    paste0("-a HLA-", sub("(.{3})(.*)", "\\1:\\2", allele)),
+    paste0("-f ", fil),
+    "-p",
+    "-rth 0.0",
+    "-rlt 0.0",
+    paste0("-l ", pep.len),
+    "-t -100"
+  )
+}
+
+
+files <- paste0("Output/peptides/", list.files("Output/peptides/"))
+
+plan(multisession, workers = 6)
+
+future_map(files, ~system2(command = "netMHCpan", 
+                      args = args_netMHC(.), 
+                      stdout  = paste0("./Output/netMHCpan_predictions/", str_split_1(., "/")[3])))
+
+
+```
+
+
+Define function to read in predictions for each peptide length, cleanup the netMHC output, and combine them in a single tsv file
+
+```{r}
+combine_and_clean <- function(allele){
+
+  file.list <- list.files("./Output/netMHCpan_predictions/", pattern = allele)
+  file.list <- paste0("./Output/netMHCpan_predictions/", file.list)
+  
+  file.list %>% 
+    map(read_lines) %>% 
+    map(~.[grepl("   1 HLA", .)]) %>% 
+    unlist() %>% 
+    c(" Pos         MHC        Peptide      Core Of Gp Gl Ip Il        Icore        Identity  Score_EL %Rank_EL", .) %>% 
+    write_lines(paste0("./Output/netMHCpan_predictions_clean/", allele,".tsv"))
+  
+  gc()
+}
+```
+
+
+Apply the function for each allele
+
+```{r}
+
+map(alleles, combine_and_clean)
+```
+
+
+
+## Finish test table
+
+Import the tables and combine into single table.
+
+```{r}
+files <- list.files("./Output/netMHCpan_predictions_clean/")
+
+files %>% 
+  str_split("\\.") %>% 
+  map(1) %>% 
+  as.character() -> alleles
+
+tibble(allele = alleles, 
+       dat = map(files, ~read_table(paste0("./Output/netMHCpan_predictions_clean/", .)))) %>% 
+  unnest(dat) -> test.table
+
+test.table
+```
+
+
+Add to test table
+
+
+```{r}
+test.table %>% 
+  transmute(sequence = Peptide, allele = allele, rank = `%Rank_EL`) %>% 
+  nest(dat = -allele) -> test.table
+
+read_tsv("./Output/nuORF_Test_Table.tsv") %>% 
+  nest(dat2 = -allele) %>% 
+  inner_join(test.table) %>% 
+  mutate(dat = map2(dat, dat2, ~inner_join(.x, .y, by = c("sequence")))) %>% 
+  select(-dat2) %>% 
+  unnest(dat) -> test.table
+
+test.table %>% 
+  count(allele, ligand)
+```
+
+
+```{r}
+write_tsv(test.table, "Output/Test_Table_nuORF_complete.tsv")
+```
+
+
+
+
+
+
+
